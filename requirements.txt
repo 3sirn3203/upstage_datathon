@@ -1,7 +1,6 @@
 # ── 필수 패키지 (반드시 설치) ───────────────────────────────────────────
 pandas>=2.0.0          # submission.csv 생성 및 검증 (validator, upstage_tracker)
 cryptography>=42.0.0   # AES-256-GCM 복호화 (decryptor.py)
-# requests>=2.31.0        # Upstage Document Parse API 호출
 
 # ── PDF 파싱 (하나 선택) ─────────────────────────────────────────────────
 # pypdf>=4.0.0          # 텍스트 레이어 추출, 경량

@@ -17,12 +17,10 @@ $ python baseline_rag.py
 
 from decryptor import load_test_suite
 from upstage_tracker import UpstageTracker
-from parse_corpus import DEFAULT_CONFIG_PATH, load_config, parse_corpus
 from validator import validate
 
 CORPUS_DIR      = "distribution/corpus"
 TEST_SUITE_PATH = "distribution/test_suite/Encrypted_Test_Suite.json"
-CONFIG          = load_config(DEFAULT_CONFIG_PATH)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -50,7 +48,6 @@ def build_index(corpus_dir: str):
     Returns:
         이후 retrieve() 에서 사용할 인덱스 객체 (형식 자유)
     """
-    
     raise NotImplementedError("build_index()를 구현하세요.")
 
 
@@ -131,8 +128,7 @@ def generate_answer(
 def run_pipeline(output_path: str = "submission.csv") -> None:
     # Phase 1: 인덱스 구축 (1회)
     print("[1/3] 인덱스 구축 중...")
-    corpus_dir = CONFIG.get("corpus", {}).get("dir", CORPUS_DIR)
-    index = build_index(corpus_dir)
+    index = build_index(CORPUS_DIR)
 
     # 질문 로드
     print("[2/3] 질문 로드 중...")
