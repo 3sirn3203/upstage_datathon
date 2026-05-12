@@ -31,7 +31,10 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from parse_corpus import DEFAULT_CONFIG_PATH, load_config  # noqa: E402
+try:
+    from .parse_corpus import DEFAULT_CONFIG_PATH, load_config  # type: ignore
+except ImportError:
+    from parse_corpus import DEFAULT_CONFIG_PATH, load_config  # type: ignore
 
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")

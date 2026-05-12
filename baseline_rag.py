@@ -15,8 +15,14 @@ baseline_rag.py — RAG 파이프라인 스켈레톤 (Starter Kit)
 $ python baseline_rag.py
 """
 
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
 from decryptor import load_test_suite
 from upstage_tracker import UpstageTracker
+from src.chunk_corpus import chunk_corpus, config_from_dict
 from src.parse_corpus import DEFAULT_CONFIG_PATH, load_config, parse_corpus
 from validator import validate
 
@@ -25,30 +31,23 @@ TEST_SUITE_PATH = "distribution/test_suite/Encrypted_Test_Suite.json"
 CONFIG          = load_config(DEFAULT_CONFIG_PATH)
 
 
+def load_chunks(path: str | Path) -> list[dict]:
+    chunks = []
+    with Path(path).open(encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if line:
+                chunks.append(json.loads(line))
+    return chunks
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # PHASE 1.  인덱스 구축  (오프라인 — 파이프라인 실행 전 1회)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def build_index(corpus_dir: str):
-    """PDF 코퍼스를 파싱·청킹하고 검색 인덱스를 반환합니다.
-
-    [TODO] 전략을 선택하고 전부 구현하세요.
-
-    ── 파싱 옵션 ──────────────────────────────────────────────
-    pypdf / pdfplumber         : 텍스트 레이어 추출, 빠름
-    Upstage Document Parse API : 레이아웃 인식, 표·이미지 포함
-
-    ── 청킹 옵션 ──────────────────────────────────────────────
-    페이지 단위 / 문단 단위 / 고정 토큰 수 / Semantic Chunking
-
-    ── 인덱싱 옵션 ────────────────────────────────────────────
-    BM25              : 키워드 기반 검색, 빠름
-    Dense Retrieval   : Upstage Embedding API / sentence-transformers
-    Hybrid (권장)     : BM25 + Dense 결합
-    Vector DB         : ChromaDB / FAISS / Pinecone 등
-
-    Returns:
-        이후 retrieve() 에서 사용할 인덱스 객체 (형식 자유)
+    """
+    PDF 코퍼스를 파싱·청킹하고 검색 인덱스를 반환합니다.
     """
     parsing_config = CONFIG.get("parsing", {})
     parsed_path = parse_corpus(
@@ -59,8 +58,19 @@ def build_index(corpus_dir: str):
         force=parsing_config.get("force", False),
     )
     print(f"  → parsed corpus: {parsed_path}")
-    
-    raise NotImplementedError("build_index()를 구현하세요.")
+
+    chunks_path = chunk_corpus(
+        parsed_path,
+        config=config_from_dict(CONFIG),
+    )
+    chunks = load_chunks(chunks_path)
+    print(f"  → chunks: {chunks_path} ({len(chunks)} chunks)")
+
+    return {
+        "parsed_path": parsed_path,
+        "chunks_path": chunks_path,
+        "chunks": chunks,
+    }
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
