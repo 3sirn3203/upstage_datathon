@@ -17,3 +17,10 @@ parsing:
     output_formats:
       - markdown
     timeout_seconds: 300
+
+chunking:
+  max_chunk_chars: 1200
+  overlap_chars: 200
+  min_chunk_chars: 80
+  include_table_chunks: true
+  output_filename: chunks.jsonl
