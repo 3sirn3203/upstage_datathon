@@ -50,15 +50,6 @@ def build_index(corpus_dir: str):
     Returns:
         이후 retrieve() 에서 사용할 인덱스 객체 (형식 자유)
     """
-    parsing_config = CONFIG.get("parsing", {})
-    parsed_path = parse_corpus(
-        corpus_dir=corpus_dir,
-        option=parsing_config.get("backend", "pdfplumber"),
-        output_dir=parsing_config.get("output_dir", "parsed_corpus"),
-        config_path=DEFAULT_CONFIG_PATH,
-        force=parsing_config.get("force", False),
-    )
-    print(f"  → parsed corpus: {parsed_path}")
     
     raise NotImplementedError("build_index()를 구현하세요.")
 
