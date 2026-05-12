@@ -23,6 +23,7 @@ from pathlib import Path
 from decryptor import load_test_suite
 from upstage_tracker import UpstageTracker
 from src.chunk_corpus import chunk_corpus, config_from_dict
+from src.index_corpus import build_dense_index, config_from_dict as dense_config_from_dict
 from src.parse_corpus import DEFAULT_CONFIG_PATH, load_config, parse_corpus
 from validator import validate
 
@@ -66,10 +67,17 @@ def build_index(corpus_dir: str):
     chunks = load_chunks(chunks_path)
     print(f"  → chunks: {chunks_path} ({len(chunks)} chunks)")
 
+    dense_index = build_dense_index(
+        chunks_path,
+        config=dense_config_from_dict(CONFIG),
+    )
+    print(f"  → dense index: {dense_index['faiss_path']} ({dense_index['num_vectors']} vectors)")
+
     return {
         "parsed_path": parsed_path,
         "chunks_path": chunks_path,
         "chunks": chunks,
+        "dense": dense_index,
     }
 
 

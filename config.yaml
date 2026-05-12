@@ -24,3 +24,19 @@ chunking:
   min_chunk_chars: 80
   include_table_chunks: true
   output_filename: chunks.jsonl
+
+indexing:
+  dense:
+    provider: upstage
+    url: https://api.upstage.ai/v1/solar/embeddings
+    passage_model: solar-embedding-1-large-passage
+    query_model: solar-embedding-1-large-query
+    dimension: 4096
+    batch_size: 16
+    sleep_seconds: 1
+    max_retries: 5
+    retry_base_seconds: 2
+    force: false
+    faiss_filename: dense.faiss
+    metadata_filename: dense_metadata.jsonl
+    embeddings_filename: dense_embeddings.npy
