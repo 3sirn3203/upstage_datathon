@@ -17,7 +17,7 @@ $ python baseline_rag.py
 
 from decryptor import load_test_suite
 from upstage_tracker import UpstageTracker
-from parse_corpus import DEFAULT_CONFIG_PATH, load_config, parse_corpus
+from src.parse_corpus import DEFAULT_CONFIG_PATH, load_config, parse_corpus
 from validator import validate
 
 CORPUS_DIR      = "distribution/corpus"
