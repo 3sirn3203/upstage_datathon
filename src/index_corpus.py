@@ -105,7 +105,7 @@ def load_chunks(path: Path) -> list[dict[str, Any]]:
 def embed_texts(texts: list[str], model: str, config: DenseIndexConfig) -> np.ndarray:
     api_key = os.environ.get("UPSTAGE_API_KEY")
     if not api_key:
-        raise EnvironmentError("UPSTAGE_API_KEY is required to build the dense index.")
+        raise EnvironmentError("UPSTAGE_API_KEY is required to call the embedding API.")
 
     if not texts:
         return np.empty((0, config.dimension), dtype=np.float32)

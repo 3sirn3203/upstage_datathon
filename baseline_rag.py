@@ -23,12 +23,16 @@ from pathlib import Path
 import urllib.error
 import urllib.request
 
+
 from decryptor import load_test_suite
 from upstage_tracker import DEFAULT_MODEL, UPSTAGE_BASE_URL, UpstageTracker
 from src.chunk_corpus import chunk_corpus, config_from_dict
 from src.index_corpus import build_dense_index, config_from_dict as dense_config_from_dict
 from src.parse_corpus import DEFAULT_CONFIG_PATH, load_config, parse_corpus
 from src.prompt import DRAFT_GENERATION_PROMPT, FINAL_SAFETY_PROMPT, QUERY_ANALYSIS_PROMPT
+from src.retriever_bm25 import BM25Retriever, config_from_dict as bm25_config_from_dict
+from src.retriever_dense import DenseRetriever
+from src.retriever_merge import config_from_dict as merge_config_from_dict, merge_retrieval_results
 from validator import validate
 
 CORPUS_DIR      = "distribution/corpus"
@@ -50,7 +54,7 @@ def llm_config(stage: str) -> dict:
     llm = CONFIG.get("llm", {})
     stage_config = llm.get(stage, {})
     return {
-        "model": stage_config.get("model", llm.get("model", DEFAULT_MODEL)),
+        "model": stage_config.get("model", DEFAULT_MODEL),
         "temperature": stage_config.get("temperature", 0),
         "max_tokens": stage_config.get("max_tokens", 768),
         "enabled": stage_config.get("enabled", True),
@@ -130,11 +134,20 @@ def build_index(corpus_dir: str):
     )
     print(f"  → dense index: {dense_index['faiss_path']} ({dense_index['num_vectors']} vectors)")
 
+    bm25_retriever = BM25Retriever(chunks, config=bm25_config_from_dict(CONFIG))
+    dense_retriever = DenseRetriever(
+        faiss_path=dense_index["faiss_path"],
+        metadata_path=dense_index["metadata_path"],
+        config=dense_config_from_dict(CONFIG),
+    )
+
     return {
         "parsed_path": parsed_path,
         "chunks_path": chunks_path,
         "chunks": chunks,
         "dense": dense_index,
+        "bm25_retriever": bm25_retriever,
+        "dense_retriever": dense_retriever,
     }
 
 
@@ -145,11 +158,8 @@ def build_index(corpus_dir: str):
 def analyze_query(question: str) -> dict:
     config = llm_config("query_analysis")
     fallback = {
-        "bm25_keywords": [question],
-        "dense_subqueries": [question],
-        "needs_multi_hop": False,
-        "sensitive_intent": False,
-        "notes": "fallback: original question only",
+        "keywords": [question],
+        "subqueries": [question],
     }
     if not config["enabled"]:
         return fallback
@@ -163,15 +173,54 @@ def analyze_query(question: str) -> dict:
     )
     try:
         parsed = json.loads(extract_json_object(content))
+        print(f"Stage 1: Query analysis output:")
+        print(json.dumps(parsed, ensure_ascii=False, indent=2))
     except (json.JSONDecodeError, ValueError):
         parsed = fallback
+        print(f"Stage 1 - Query analysis failed to parse JSON. Using fallback:")
 
-    parsed.setdefault("bm25_keywords", [question])
-    parsed.setdefault("dense_subqueries", [question])
-    parsed.setdefault("needs_multi_hop", False)
-    parsed.setdefault("sensitive_intent", False)
-    parsed.setdefault("notes", "")
-    return parsed
+    return normalize_query_plan(parsed, question)
+
+
+def normalize_query_plan(parsed: dict, question: str) -> dict:
+    keywords = coerce_string_list(
+        parsed.get("keywords", parsed.get("bm25_keywords")),
+        fallback=[question],
+        limit=10,
+    )
+    subqueries = coerce_string_list(
+        parsed.get("subqueries", parsed.get("dense_subqueries")),
+        fallback=[question],
+        limit=3,
+    )
+    if not subqueries:
+        subqueries = [question]
+
+    return {
+        "keywords": keywords,
+        "subqueries": subqueries,
+    }
+
+
+def coerce_string_list(value, *, fallback: list[str], limit: int) -> list[str]:
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, list):
+        items = value
+    else:
+        items = fallback
+
+    cleaned = []
+    seen = set()
+    for item in items:
+        text = str(item).strip()
+        if not text or text in seen:
+            continue
+        cleaned.append(text)
+        seen.add(text)
+        if len(cleaned) >= limit:
+            break
+    return cleaned
 
 
 def extract_json_object(text: str) -> str:
@@ -190,12 +239,62 @@ def retrieve(question: str, query_plan: dict, index, top_k: int = 8) -> str:
     """질문과 query plan을 바탕으로 관련 chunk context를 반환합니다.
 
     TODO:
-    - BM25 retriever 구현 및 bm25_keywords 기반 top-n 검색
-    - Upstage query embedding + FAISS dense retrieval 구현
     - BM25/dense 후보를 RRF 또는 weighted score로 merge
     - source/page/section 중복 제거 및 context budget 적용
     """
-    raise NotImplementedError("retrieve()에 BM25 + dense hybrid 검색을 구현하세요.")
+    retrieval_config = CONFIG.get("retrieval", {})
+    bm25_top_k = int(retrieval_config.get("bm25_top_k", 30))
+    dense_top_k = int(retrieval_config.get("dense_top_k", 10))
+    final_top_k = int(retrieval_config.get("final_top_k", top_k))
+
+    keywords = query_plan.get("keywords") or [question]
+    subqueries = [question, *(query_plan.get("subqueries") or [])]
+
+    bm25_results = index["bm25_retriever"].search(keywords, top_k=bm25_top_k)
+    dense_result_lists = index["dense_retriever"].search_many(subqueries, top_k=dense_top_k)
+
+    print(
+        "  [Retrieval] "
+        f"BM25={len(bm25_results)} candidates | "
+        f"Dense={sum(len(results) for results in dense_result_lists)} candidates "
+        f"from {len(dense_result_lists)} subqueries"
+    )
+
+    merged_results = merge_retrieval_results(
+        bm25_results=bm25_results,
+        dense_result_lists=dense_result_lists,
+        top_k=final_top_k,
+        query_plan=query_plan,
+        config=merge_config_from_dict(CONFIG),
+    )
+    return format_context(merged_results)
+
+
+def format_context(results: list[dict]) -> str:
+    parts = []
+    for idx, item in enumerate(results, start=1):
+        chunk = item["chunk"]
+        source = chunk.get("source", "")
+        page = chunk.get("page", "")
+        section = chunk.get("section", "")
+        retriever = item.get("retriever", "")
+        score = item.get("score", 0)
+        provenance = format_provenance(item.get("retrieved_from", {}))
+        header = (
+            f"[{idx}] source={source} page={page} section={section} "
+            f"retriever={retriever} score={score:.4f}"
+        )
+        if provenance:
+            header = f"{header}\nretrieval={provenance}"
+        parts.append(f"{header}\n{chunk.get('text', '')}")
+    return "\n\n---\n\n".join(parts)
+
+
+def format_provenance(retrieved_from: dict) -> str:
+    parts = []
+    for name, info in sorted(retrieved_from.items()):
+        parts.append(f"{name} rank={info.get('rank')} score={float(info.get('score', 0)):.4f}")
+    return "; ".join(parts)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -282,7 +381,8 @@ def run_pipeline(output_path: str = "submission.csv") -> None:
     print("[3/3] 파이프라인 실행 중...")
     tracker = UpstageTracker()
 
-    for q in questions:
+    for i, q in enumerate(questions):
+        print(f"Processing question {i+1}/{len(questions)}: {q['question']}")
         query_plan = analyze_query(q["question"])
         context = retrieve(q["question"], query_plan, index)
         draft_answer = generate_draft_answer(
@@ -299,7 +399,10 @@ def run_pipeline(output_path: str = "submission.csv") -> None:
             question_id=q["question_id"],
             token=q["token"],
         )
-        print(f"  [{q['question_id']}] {answer[:60]}...")
+        print(f"Question: {q['question']}")
+        print(f"Answer: {answer}...")
+        print("-" * 80)
+        print()
 
     # 저장 + 검증
     print()

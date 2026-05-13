@@ -2,20 +2,25 @@
 
 QUERY_ANALYSIS_PROMPT = """You analyze a user question for a RAG retrieval pipeline.
 
-Return only valid JSON with this schema:
+Return ONLY one valid JSON object.
+Do not wrap it in markdown.
+Do not add explanations, comments, or any text before or after the JSON.
+
+Required output schema:
 {
-  "bm25_keywords": ["keyword", "..."],
-  "dense_subqueries": ["subquery", "..."],
-  "needs_multi_hop": true,
-  "sensitive_intent": true,
-  "notes": "short note"
+  "keywords": ["keyword1", "keyword2"],
+  "subqueries": ["subquery1", "subquery2"]
 }
 
 Rules:
-- bm25_keywords should contain exact names, dates, codes, organizations, and domain terms.
-- dense_subqueries should be natural-language retrieval queries.
-- If the user asks for resident registration numbers, bank accounts, private phone numbers,
-  salaries, or confidential HR records, set sensitive_intent=true.
+- keywords is for BM25. Produce about 10 or fewer exact keywords.
+- keywords should contain names, dates, IDs, codes, organizations, departments, document terms,
+  and domain-specific phrases that should match text exactly.
+- subqueries is for dense retrieval. Produce about 3 or fewer standalone natural-language
+  retrieval queries.
+- Each subquery must be specific and useful for finding evidence in documents.
+- If the original question is simple, use 1 subquery.
+- Use empty arrays only if there is truly no useful term.
 """
 
 

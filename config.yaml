@@ -26,6 +26,10 @@ chunking:
   output_filename: chunks.jsonl
 
 indexing:
+  bm25:
+    k1: 1.5
+    b: 0.75
+    top_k: 30
   dense:
     provider: upstage
     url: https://api.upstage.ai/v1/solar/embeddings
@@ -41,16 +45,30 @@ indexing:
     metadata_filename: dense_metadata.jsonl
     embeddings_filename: dense_embeddings.npy
 
+retrieval:
+  bm25_top_k: 30
+  dense_top_k: 10
+  final_top_k: 20
+  merge:
+    rrf_k: 30
+    max_candidates: 40
+    max_chunks_per_doc: 4
+    max_chunks_per_section: 2
+    coverage_weight: 0.25
+    doc_repeat_penalty: 0.10
+
 llm:
-  model: solar-mini
   query_analysis:
+    model: solar-pro
     enabled: true
     temperature: 0
     max_tokens: 512
   draft_generation:
+    model: solar-pro
     enabled: true
     temperature: 0
     max_tokens: 768
   final_generation:
+    model: solar-pro
     temperature: 0
     max_tokens: 768
