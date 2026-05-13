@@ -400,7 +400,7 @@ def run_pipeline(output_path: str = "submission.csv") -> None:
             token=q["token"],
         )
         print(f"Question: {q['question']}")
-        print(f"Answer: {answer}...")
+        print(f"Answer: {answer.strip()}")
         print("-" * 80)
         print()
 
