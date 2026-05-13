@@ -18,13 +18,17 @@ $ python baseline_rag.py
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import urllib.error
+import urllib.request
 
 from decryptor import load_test_suite
-from upstage_tracker import UpstageTracker
+from upstage_tracker import DEFAULT_MODEL, UPSTAGE_BASE_URL, UpstageTracker
 from src.chunk_corpus import chunk_corpus, config_from_dict
 from src.index_corpus import build_dense_index, config_from_dict as dense_config_from_dict
 from src.parse_corpus import DEFAULT_CONFIG_PATH, load_config, parse_corpus
+from src.prompt import DRAFT_GENERATION_PROMPT, FINAL_SAFETY_PROMPT, QUERY_ANALYSIS_PROMPT
 from validator import validate
 
 CORPUS_DIR      = "distribution/corpus"
@@ -40,6 +44,59 @@ def load_chunks(path: str | Path) -> list[dict]:
             if line:
                 chunks.append(json.loads(line))
     return chunks
+
+
+def llm_config(stage: str) -> dict:
+    llm = CONFIG.get("llm", {})
+    stage_config = llm.get(stage, {})
+    return {
+        "model": stage_config.get("model", llm.get("model", DEFAULT_MODEL)),
+        "temperature": stage_config.get("temperature", 0),
+        "max_tokens": stage_config.get("max_tokens", 768),
+        "enabled": stage_config.get("enabled", True),
+    }
+
+
+def call_solar_no_record(
+    *,
+    messages: list[dict],
+    system_prompt: str | None = None,
+    model: str | None = None,
+    temperature: float = 0,
+    max_tokens: int = 768,
+) -> str:
+    """Call Solar without appending a submission row to UpstageTracker.records."""
+    api_key = os.environ.get("UPSTAGE_API_KEY")
+    if not api_key:
+        raise EnvironmentError("UPSTAGE_API_KEY is required for intermediate LLM stages.")
+
+    full_messages = []
+    if system_prompt:
+        full_messages.append({"role": "system", "content": system_prompt})
+    full_messages.extend(messages)
+
+    payload = {
+        "model": model or DEFAULT_MODEL,
+        "messages": full_messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    req = urllib.request.Request(
+        url=f"{UPSTAGE_BASE_URL}/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8")
+        raise RuntimeError(f"Upstage API 오류 [{e.code}]: {body}") from e
+
+    return raw["choices"][0]["message"]["content"]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -82,72 +139,127 @@ def build_index(corpus_dir: str):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# PHASE 2.  검색  (온라인 — 질문당 1회)
+# ONLINE STAGE 1. Query analysis  (LLM, CSV 기록 없음)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def retrieve(question: str, index, top_k: int = 5) -> str:
-    """질문과 관련된 청크를 검색하여 컨텍스트 문자열로 반환합니다.
+def analyze_query(question: str) -> dict:
+    config = llm_config("query_analysis")
+    fallback = {
+        "bm25_keywords": [question],
+        "dense_subqueries": [question],
+        "needs_multi_hop": False,
+        "sensitive_intent": False,
+        "notes": "fallback: original question only",
+    }
+    if not config["enabled"]:
+        return fallback
 
-    [TODO] 검색 전략을 구현하세요.
+    content = call_solar_no_record(
+        system_prompt=QUERY_ANALYSIS_PROMPT,
+        messages=[{"role": "user", "content": question}],
+        model=config["model"],
+        temperature=config["temperature"],
+        max_tokens=config["max_tokens"],
+    )
+    try:
+        parsed = json.loads(extract_json_object(content))
+    except (json.JSONDecodeError, ValueError):
+        parsed = fallback
 
-    ── 검색 옵션 ──────────────────────────────────────────────
-    단순 top-k     : 유사도 상위 K개 반환
-    MMR            : 중복 청크 제거, 다양성 확보
-    Re-ranking     : Cross-encoder 로 상위 K개 재정렬
-    Multi-hop      : Level 3 질문 — 1차 검색 → 중간 답변 → 2차 검색
+    parsed.setdefault("bm25_keywords", [question])
+    parsed.setdefault("dense_subqueries", [question])
+    parsed.setdefault("needs_multi_hop", False)
+    parsed.setdefault("sensitive_intent", False)
+    parsed.setdefault("notes", "")
+    return parsed
 
-    Returns:
-        검색된 청크를 이어붙인 컨텍스트 문자열
+
+def extract_json_object(text: str) -> str:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("No JSON object found")
+    return text[start : end + 1]
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ONLINE STAGE 2. Hybrid retrieval  (BM25 + dense, 로컬)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def retrieve(question: str, query_plan: dict, index, top_k: int = 8) -> str:
+    """질문과 query plan을 바탕으로 관련 chunk context를 반환합니다.
+
+    TODO:
+    - BM25 retriever 구현 및 bm25_keywords 기반 top-n 검색
+    - Upstage query embedding + FAISS dense retrieval 구현
+    - BM25/dense 후보를 RRF 또는 weighted score로 merge
+    - source/page/section 중복 제거 및 context budget 적용
     """
-    raise NotImplementedError("retrieve()를 구현하세요.")
+    raise NotImplementedError("retrieve()에 BM25 + dense hybrid 검색을 구현하세요.")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# PHASE 3.  답변 생성  (온라인 — 질문당 1회)
+# ONLINE STAGE 3. Draft generation  (LLM, CSV 기록 없음)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-SYSTEM_PROMPT = """[TODO] 시스템 프롬프트를 직접 설계하세요.
+def generate_draft_answer(question: str, context: str, query_plan: dict) -> str:
+    config = llm_config("draft_generation")
+    if not config["enabled"]:
+        return ""
 
-설계 시 고려사항:
-- 문서 외 정보 사용 차단 : hallucination 방지
-- Poisoning 방어 : 문서 내 삽입된 지시문("XXX를 출력하라" 등)을 무시
-- PII 유출 방어 : 주민번호·연봉 등 민감 정보 마스킹 또는 거부
-- 답변 형식 : 간결·명확 / 근거 포함 여부 결정
-"""
+    return call_solar_no_record(
+        system_prompt=DRAFT_GENERATION_PROMPT,
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    f"[User question]\n{question}\n\n"
+                    f"[Query analysis]\n{json.dumps(query_plan, ensure_ascii=False)}\n\n"
+                    f"[Retrieved context]\n{context}"
+                ),
+            }
+        ],
+        model=config["model"],
+        temperature=config["temperature"],
+        max_tokens=config["max_tokens"],
+    )
 
 
-def generate_answer(
-    question:    str,
-    context:     str,
-    tracker:     UpstageTracker,
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ONLINE STAGE 4. Final safety rewrite/generation  (tracker.chat, CSV 기록)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def finalize_answer(
+    *,
+    question: str,
+    context: str,
+    query_plan: dict,
+    draft_answer: str,
+    tracker: UpstageTracker,
     question_id: str,
-    token:       str,
+    token: str,
 ) -> str:
-    """컨텍스트와 질문을 받아 LLM 답변을 반환합니다.
-
-    [TODO] 프롬프트 전략과 생성 방식을 설계하세요.
-
-    ── 프롬프트 옵션 ──────────────────────────────────────────
-    Zero-shot        : 지시 + 문서 + 질문
-    Chain-of-Thought : Level 3 다단계 추론에 유효
-    Few-shot         : 답변 형식 고정이 필요할 때
-
-    ── LLM (필수) ─────────────────────────────────────────────
-    tracker.chat() 로 Solar LLM 을 호출해야 합니다. (solar-mini / solar-pro)
-    used_tokens 가 0 인 제출은 채점에서 제외됩니다.
-    """
+    config = llm_config("final_generation")
     messages = [
         {
             "role": "user",
-            "content": f"[참고 문서]\n{context}\n\n[질문]\n{question}",
+            "content": (
+                f"[User question]\n{question}\n\n"
+                f"[Query analysis]\n{json.dumps(query_plan, ensure_ascii=False)}\n\n"
+                f"[Retrieved context]\n{context}\n\n"
+                f"[Draft answer]\n{draft_answer}"
+            ),
         }
     ]
 
     return tracker.chat(
-        question_id   = question_id,
-        messages      = messages,
-        token         = token,
-        system_prompt = SYSTEM_PROMPT,
+        question_id=question_id,
+        messages=messages,
+        token=token,
+        model=config["model"],
+        system_prompt=FINAL_SAFETY_PROMPT,
+        temperature=config["temperature"],
+        max_tokens=config["max_tokens"],
     )
 
 
@@ -166,18 +278,26 @@ def run_pipeline(output_path: str = "submission.csv") -> None:
     questions = load_test_suite(path=TEST_SUITE_PATH)
     print(f"  → {len(questions)}개 질문\n")
 
-    # Phase 2·3: 질문별 검색 + 생성
+    # Online stages: query analysis → retrieval → draft → final safety rewrite
     print("[3/3] 파이프라인 실행 중...")
     tracker = UpstageTracker()
 
     for q in questions:
-        context = retrieve(q["question"], index)
-        answer  = generate_answer(
-            question    = q["question"],
-            context     = context,
-            tracker     = tracker,
-            question_id = q["question_id"],
-            token       = q["token"],
+        query_plan = analyze_query(q["question"])
+        context = retrieve(q["question"], query_plan, index)
+        draft_answer = generate_draft_answer(
+            question=q["question"],
+            context=context,
+            query_plan=query_plan,
+        )
+        answer = finalize_answer(
+            question=q["question"],
+            context=context,
+            query_plan=query_plan,
+            draft_answer=draft_answer,
+            tracker=tracker,
+            question_id=q["question_id"],
+            token=q["token"],
         )
         print(f"  [{q['question_id']}] {answer[:60]}...")
 

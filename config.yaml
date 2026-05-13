@@ -40,3 +40,17 @@ indexing:
     faiss_filename: dense.faiss
     metadata_filename: dense_metadata.jsonl
     embeddings_filename: dense_embeddings.npy
+
+llm:
+  model: solar-mini
+  query_analysis:
+    enabled: true
+    temperature: 0
+    max_tokens: 512
+  draft_generation:
+    enabled: true
+    temperature: 0
+    max_tokens: 768
+  final_generation:
+    temperature: 0
+    max_tokens: 768
