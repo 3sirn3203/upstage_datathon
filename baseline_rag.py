@@ -344,8 +344,6 @@ def finalize_answer(
             "role": "user",
             "content": (
                 f"[User question]\n{question}\n\n"
-                f"[Query analysis]\n{json.dumps(query_plan, ensure_ascii=False)}\n\n"
-                f"[Retrieved context]\n{context}\n\n"
                 f"[Draft answer]\n{draft_answer}"
             ),
         }
@@ -399,8 +397,9 @@ def run_pipeline(output_path: str = "submission.csv") -> None:
             question_id=q["question_id"],
             token=q["token"],
         )
+        answer_one_line = answer.replace("\n", " ")
         print(f"Question: {q['question']}")
-        print(f"Answer: {answer.strip()}")
+        print(f"Answer: {answer_one_line}")
         print("-" * 80)
         print()
 
