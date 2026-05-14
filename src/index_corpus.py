@@ -202,7 +202,13 @@ def build_dense_index(
     metadata_path = target_dir / dense_config.metadata_filename
     embeddings_path = target_dir / dense_config.embeddings_filename
 
-    if faiss_path.exists() and metadata_path.exists() and embeddings_path.exists() and not should_force:
+    if (
+        faiss_path.exists()
+        and metadata_path.exists()
+        and embeddings_path.exists()
+        and count_jsonl(chunks_path) == count_jsonl(metadata_path)
+        and not should_force
+    ):
         print(f"[index_corpus] using cached dense index: {faiss_path}")
         return {
             "faiss_path": faiss_path,

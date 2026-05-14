@@ -157,17 +157,49 @@ def _extract_content(value: Any) -> str:
     return ""
 
 
+def _extract_upstage_element(item: dict[str, Any]) -> dict[str, Any] | None:
+    text = (
+        _extract_content(item.get("content"))
+        or _extract_content(item.get("markdown"))
+        or _extract_content(item.get("html"))
+        or _extract_content(item.get("text"))
+    )
+    if not text:
+        return None
+
+    element = {
+        "id": item.get("id"),
+        "category": item.get("category", ""),
+        "text": text,
+    }
+    if item.get("coordinates") is not None:
+        element["coordinates"] = item["coordinates"]
+    return element
+
+
 def upstage_response_to_pages(source: str, response: dict[str, Any]) -> list[dict[str, Any]]:
     pages: dict[int, list[str]] = defaultdict(list)
+    page_elements: dict[int, list[dict[str, Any]]] = defaultdict(list)
 
-    for key in ("pages", "elements"):
-        items = response.get(key)
-        if not isinstance(items, list):
-            continue
-        for item in items:
+    elements = response.get("elements")
+    if isinstance(elements, list):
+        for item in elements:
             if not isinstance(item, dict):
                 continue
             page = int(item.get("page") or item.get("page_number") or item.get("page_idx") or 1)
+            element = _extract_upstage_element(item)
+            if element:
+                pages[page].append(element["text"])
+                page_elements[page].append(element)
+
+    page_items = response.get("pages")
+    if isinstance(page_items, list):
+        for item in page_items:
+            if not isinstance(item, dict):
+                continue
+            page = int(item.get("page") or item.get("page_number") or item.get("page_idx") or 1)
+            if page in pages:
+                continue
             text = (
                 _extract_content(item.get("content"))
                 or _extract_content(item.get("markdown"))
@@ -193,7 +225,18 @@ def upstage_response_to_pages(source: str, response: dict[str, Any]) -> list[dic
             "page": page,
             "backend": "upstage_api",
             "text": "\n\n".join(parts),
-            "tables": [],
+            "tables": [
+                {
+                    "table_index": table_index,
+                    "text": element["text"],
+                    "element_id": element.get("id"),
+                }
+                for table_index, element in enumerate(
+                    [element for element in page_elements.get(page, []) if element.get("category") == "table"],
+                    start=1,
+                )
+            ],
+            "elements": page_elements.get(page, []),
         }
         for page, parts in sorted(pages.items())
     ]

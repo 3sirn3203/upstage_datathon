@@ -8,10 +8,11 @@ Output:
     parsed_corpus/<backend>/chunks.jsonl
 
 Strategy:
-    - Split Markdown text by heading sections (#, ##, ###, ...).
+    - Prefer parser-provided element boundaries when available.
+    - Keep Upstage table elements as standalone table chunks.
+    - Split Markdown text by heading sections (#, ##, ###, ...) as fallback.
     - Keep heading path metadata on every chunk.
-    - Keep tables inside paragraph/section chunks.
-    - Emit additional table chunks for Markdown tables and pdfplumber tables.
+    - Emit table chunks for Markdown tables and pdfplumber tables.
     - If a section is too long, split with overlap while preserving block boundaries
       when possible.
 """
@@ -32,9 +33,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 try:
-    from .parse_corpus import DEFAULT_CONFIG_PATH, load_config  # type: ignore
+    from .parse_corpus import DEFAULT_CONFIG_PATH, load_config, upstage_response_to_pages  # type: ignore
 except ImportError:
-    from parse_corpus import DEFAULT_CONFIG_PATH, load_config  # type: ignore
+    from parse_corpus import DEFAULT_CONFIG_PATH, load_config, upstage_response_to_pages  # type: ignore
 
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
@@ -57,6 +58,13 @@ class Section:
     text: str
 
 
+@dataclass
+class ElementBlock:
+    category: str
+    text: str
+    element_id: Any = None
+
+
 def normalize_text(text: str) -> str:
     lines = [line.rstrip() for line in text.splitlines()]
     normalized = "\n".join(lines).strip()
@@ -66,6 +74,38 @@ def normalize_text(text: str) -> str:
 def heading_text(line: str) -> str:
     match = HEADING_RE.match(line)
     return match.group(2).strip() if match else ""
+
+
+def element_heading_level(category: str, text: str) -> int | None:
+    match = re.fullmatch(r"heading([1-6])", category.lower())
+    if match:
+        return int(match.group(1))
+
+    first_line = text.splitlines()[0] if text else ""
+    match = HEADING_RE.match(first_line)
+    return len(match.group(1)) if match else None
+
+
+def element_title(text: str) -> str:
+    first_line = text.splitlines()[0] if text else ""
+    return heading_text(first_line) or first_line.strip()
+
+
+def record_elements(record: dict[str, Any]) -> list[ElementBlock]:
+    elements: list[ElementBlock] = []
+    for item in record.get("elements", []):
+        if not isinstance(item, dict):
+            continue
+        text = normalize_text(str(item.get("text") or ""))
+        if text:
+            elements.append(
+                ElementBlock(
+                    category=str(item.get("category") or ""),
+                    text=text,
+                    element_id=item.get("id"),
+                )
+            )
+    return elements
 
 
 def split_markdown_sections(text: str) -> list[Section]:
@@ -302,6 +342,179 @@ def table_rows_to_markdown(rows: list[list[Any]]) -> str:
     return "\n".join(lines)
 
 
+def table_embedding_text(table_text: str, heading_path: list[str]) -> str:
+    if not heading_path:
+        return table_text
+    return normalize_text(f"Section: {' > '.join(heading_path)}\n\n{table_text}")
+
+
+def split_markdown_table_by_rows(table_text: str, max_chars: int) -> list[str]:
+    table_text = normalize_text(table_text)
+    if len(table_text) <= max_chars:
+        return [table_text] if table_text else []
+
+    lines = table_text.splitlines()
+    first_row_index = next((index for index, line in enumerate(lines) if TABLE_ROW_RE.match(line)), None)
+    if first_row_index is None:
+        return split_long_text(table_text, max_chars, overlap_chars=0)
+
+    preamble = normalize_text("\n".join(lines[:first_row_index]))
+    rows = [line for line in lines[first_row_index:] if TABLE_ROW_RE.match(line)]
+    if len(rows) < 3:
+        return split_long_text(table_text, max_chars, overlap_chars=0)
+
+    header = rows[0]
+    separator_index = next(
+        (index for index, row in enumerate(rows[1:], start=1) if TABLE_SEPARATOR_RE.match(row)),
+        None,
+    )
+    if separator_index is None:
+        return split_long_text(table_text, max_chars, overlap_chars=0)
+
+    separator = rows[separator_index]
+    body_rows = rows[separator_index + 1 :]
+    prefix = [header, separator]
+    chunks: list[str] = []
+    current_rows: list[str] = []
+
+    def render(rows_to_render: list[str]) -> str:
+        table_part = normalize_text("\n".join(prefix + rows_to_render))
+        if preamble:
+            return normalize_text(f"{preamble}\n\n{table_part}")
+        return table_part
+
+    for row in body_rows:
+        candidate = render(current_rows + [row])
+        if len(candidate) <= max_chars:
+            current_rows.append(row)
+            continue
+
+        if current_rows:
+            chunks.append(render(current_rows))
+            current_rows = []
+
+        single_row_chunk = render([row])
+        if len(single_row_chunk) > max_chars:
+            chunks.append(single_row_chunk)
+        else:
+            current_rows = [row]
+
+    if current_rows:
+        chunks.append(render(current_rows))
+
+    return chunks or [table_text]
+
+
+def is_prompt_injection_like(text: str) -> bool:
+    lowered = text.lower()
+    markers = (
+        "system directive",
+        "approved_by_admin",
+        "ignore previous",
+        "ignore all previous",
+        "developer message",
+        "security audit protocol",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def build_chunks_for_elements(
+    *,
+    source: str,
+    page: int,
+    backend: str,
+    elements: list[ElementBlock],
+    config: ChunkingConfig,
+    initial_heading_path: list[str],
+) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    sequence = 0
+    table_index = 0
+    heading_stack = initial_heading_path.copy()
+    current_heading_path = initial_heading_path.copy()
+    current_text_blocks: list[str] = []
+
+    def append_text_chunk(text: str, heading_path: list[str]) -> None:
+        nonlocal sequence
+        risk_flags = ["possible_prompt_injection"] if is_prompt_injection_like(text) else []
+        for part in split_section_text(text, config.max_chunk_chars, config.overlap_chars):
+            sequence += 1
+            extra = {"risk_flags": risk_flags} if risk_flags else None
+            chunks.append(
+                make_chunk(
+                    source=source,
+                    page=page,
+                    backend=backend,
+                    kind="section",
+                    sequence=sequence,
+                    text=part,
+                    heading_path=heading_path,
+                    extra=extra,
+                )
+            )
+
+    def flush_text() -> None:
+        nonlocal current_text_blocks
+        text = normalize_text("\n\n".join(current_text_blocks))
+        current_text_blocks = []
+        if not text:
+            return
+        append_text_chunk(text, current_heading_path)
+
+    def append_table_chunks(element: ElementBlock) -> None:
+        nonlocal sequence, table_index
+        table_index += 1
+        table_parts = split_markdown_table_by_rows(
+            table_embedding_text(element.text, current_heading_path),
+            config.max_chunk_chars,
+        )
+        for part_index, table_part in enumerate(table_parts, start=1):
+            sequence += 1
+            extra = {
+                "table_index": table_index,
+                "element_id": element.element_id,
+                "element_category": element.category,
+            }
+            if len(table_parts) > 1:
+                extra["table_part"] = part_index
+                extra["table_parts"] = len(table_parts)
+            chunks.append(
+                make_chunk(
+                    source=source,
+                    page=page,
+                    backend=backend,
+                    kind="table",
+                    sequence=sequence,
+                    text=table_part,
+                    heading_path=current_heading_path,
+                    extra=extra,
+                )
+            )
+
+    for element in elements:
+        level = element_heading_level(element.category, element.text)
+        if level is not None:
+            flush_text()
+            title = element_title(element.text)
+            if title:
+                heading_stack = heading_stack[: level - 1]
+                heading_stack.append(title)
+                current_heading_path = heading_stack.copy()
+            continue
+
+        if element.category.lower() == "table":
+            flush_text()
+            if not config.include_table_chunks:
+                continue
+            append_table_chunks(element)
+            continue
+
+        current_text_blocks.append(element.text)
+
+    flush_text()
+    return chunks
+
+
 def build_chunks_for_record(record: dict[str, Any], config: ChunkingConfig) -> list[dict[str, Any]]:
     return build_chunks_for_record_with_context(record, config, initial_heading_path=[])
 
@@ -315,6 +528,17 @@ def build_chunks_for_record_with_context(
     source = record["source"]
     page = int(record["page"])
     backend = record.get("backend", "")
+    elements = record_elements(record)
+    if elements:
+        return build_chunks_for_elements(
+            source=source,
+            page=page,
+            backend=backend,
+            elements=elements,
+            config=config,
+            initial_heading_path=initial_heading_path,
+        )
+
     text = normalize_text(record.get("text", ""))
     chunks: list[dict[str, Any]] = []
     sequence = 0
@@ -387,6 +611,43 @@ def load_pages(path: Path) -> Iterable[dict[str, Any]]:
                 yield json.loads(line)
 
 
+def load_upstage_raw_pages(raw_path: Path, source: str) -> list[dict[str, Any]]:
+    if not raw_path.exists():
+        return []
+    with raw_path.open(encoding="utf-8") as file:
+        response = json.load(file)
+    if not isinstance(response, dict):
+        return []
+    return upstage_response_to_pages(source, response)
+
+
+def enrich_record_from_raw(
+    record: dict[str, Any],
+    *,
+    pages_dir: Path,
+    raw_cache: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    if record.get("elements") or record.get("backend") != "upstage_api":
+        return record
+
+    source = str(record.get("source", ""))
+    if not source:
+        return record
+
+    if source not in raw_cache:
+        raw_cache[source] = load_upstage_raw_pages(pages_dir / "raw" / f"{Path(source).stem}.json", source)
+
+    page = int(record.get("page") or 1)
+    for raw_record in raw_cache[source]:
+        if int(raw_record.get("page") or 1) == page:
+            enriched = dict(record)
+            enriched["elements"] = raw_record.get("elements", [])
+            if not enriched.get("tables"):
+                enriched["tables"] = raw_record.get("tables", [])
+            return enriched
+    return record
+
+
 def chunk_corpus(
     pages_path: str | Path,
     *,
@@ -399,8 +660,10 @@ def chunk_corpus(
 
     chunk_count = 0
     last_heading_by_source: dict[str, list[str]] = {}
+    raw_cache: dict[str, list[dict[str, Any]]] = {}
     with output.open("w", encoding="utf-8") as file:
         for record in load_pages(pages_path):
+            record = enrich_record_from_raw(record, pages_dir=pages_path.parent, raw_cache=raw_cache)
             source = record.get("source", "")
             chunks = build_chunks_for_record_with_context(
                 record,
