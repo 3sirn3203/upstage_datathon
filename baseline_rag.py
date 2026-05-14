@@ -33,6 +33,7 @@ from src.prompt import DRAFT_GENERATION_PROMPT, FINAL_SAFETY_PROMPT, QUERY_ANALY
 from src.retriever_bm25 import BM25Retriever, config_from_dict as bm25_config_from_dict
 from src.retriever_dense import DenseRetriever
 from src.retriever_merge import config_from_dict as merge_config_from_dict, merge_retrieval_results
+from src.detect_poisoning import build_suspicion_map, suspicion_label
 from validator import validate
 
 CORPUS_DIR      = "distribution/corpus"
@@ -141,6 +142,9 @@ def build_index(corpus_dir: str):
         config=dense_config_from_dict(CONFIG),
     )
 
+    suspicion_map = build_suspicion_map(corpus_dir)
+    print(f"  → suspicion map: {sum(len(pages) for pages in suspicion_map.values())} suspicious pages across {len(suspicion_map)} files")
+
     return {
         "parsed_path": parsed_path,
         "chunks_path": chunks_path,
@@ -148,6 +152,7 @@ def build_index(corpus_dir: str):
         "dense": dense_index,
         "bm25_retriever": bm25_retriever,
         "dense_retriever": dense_retriever,
+        "suspicion_map": suspicion_map,
     }
 
 
@@ -235,7 +240,7 @@ def extract_json_object(text: str) -> str:
 # ONLINE STAGE 2. Hybrid retrieval  (BM25 + dense, 로컬)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def retrieve(question: str, query_plan: dict, index, top_k: int = 8) -> str:
+def retrieve(question: str, query_plan: dict, index, top_k: int = 8, suspicion_map: dict | None = None) -> str:
     """질문과 query plan을 바탕으로 관련 chunk context를 반환합니다.
 
     TODO:
@@ -267,10 +272,10 @@ def retrieve(question: str, query_plan: dict, index, top_k: int = 8) -> str:
         query_plan=query_plan,
         config=merge_config_from_dict(CONFIG),
     )
-    return format_context(merged_results)
+    return format_context(merged_results, suspicion_map=suspicion_map or {})
 
 
-def format_context(results: list[dict]) -> str:
+def format_context(results: list[dict], *, suspicion_map: dict | None = None) -> str:
     parts = []
     for idx, item in enumerate(results, start=1):
         chunk = item["chunk"]
@@ -286,7 +291,13 @@ def format_context(results: list[dict]) -> str:
         )
         if provenance:
             header = f"{header}\nretrieval={provenance}"
-        parts.append(f"{header}\n{chunk.get('text', '')}")
+
+        body = chunk.get("text", "")
+        findings = (suspicion_map or {}).get(source, {}).get(page, [])
+        if findings:
+            body = f"{suspicion_label(findings)}\n{body}"
+
+        parts.append(f"{header}\n{body}")
     return "\n\n---\n\n".join(parts)
 
 
@@ -382,7 +393,7 @@ def run_pipeline(output_path: str = "submission.csv") -> None:
     for i, q in enumerate(questions):
         print(f"Processing question {i+1}/{len(questions)}: {q['question']}")
         query_plan = analyze_query(q["question"])
-        context = retrieve(q["question"], query_plan, index)
+        context = retrieve(q["question"], query_plan, index, suspicion_map=index["suspicion_map"])
         draft_answer = generate_draft_answer(
             question=q["question"],
             context=context,
