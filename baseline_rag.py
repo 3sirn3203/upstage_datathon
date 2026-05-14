@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 import urllib.error
 import urllib.request
@@ -155,6 +156,33 @@ def build_index(corpus_dir: str):
 # ONLINE STAGE 1. Query analysis  (LLM, CSV 기록 없음)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def sanitize_query(question: str) -> str:
+    # 1. 특정 문구 출력 강요 패턴 (주은님이 말씀하신 '적어라', '출력해라'의 영어 버전)
+    # 문장 중간이나 끝에 "output/print/say/write [특정문구]"가 오는 경우를 차단합니다.
+    imperative_patterns = [
+        r"(?i)(must\s+)?(output|print|say|write|type|append|end\s+with)\s+['\"].*?['\"]",
+        r"(?i)respond\s+with\s+['\"].*?['\"]",
+        r"(?i)include\s+the\s+(phrase|word|string)\s+['\"].*?['\"]",
+    ]
+    
+    clean_q = question
+    for p in imperative_patterns:
+        clean_q = re.sub(p, "", clean_q)
+
+    # 2. 시스템 지시 무시 및 역할 탈취 패턴 (Jailbreak 방어)
+    system_attack_patterns = [
+        r"(?i)ignore\s+(all\s+)?previous\s+instructions",
+        r"(?i)disregard\s+system\s+prompts",
+        r"(?i)you\s+are\s+now\s+a\s+.*?", # 역할 부여 공격 차단
+    ]
+    for p in system_attack_patterns:
+        clean_q = re.sub(p, "", clean_q)
+
+    # 3. 불필요한 메타데이터 태그 제거 ([Poisoning] 등)
+    clean_q = re.sub(r"\[.*?\]", "", clean_q)
+    
+    return clean_q.strip()
+    
 def analyze_query(question: str) -> dict:
     config = llm_config("query_analysis")
     fallback = {
@@ -381,15 +409,16 @@ def run_pipeline(output_path: str = "submission.csv") -> None:
 
     for i, q in enumerate(questions):
         print(f"Processing question {i+1}/{len(questions)}: {q['question']}")
-        query_plan = analyze_query(q["question"])
-        context = retrieve(q["question"], query_plan, index)
+        sanitized_q = sanitize_query(q["question"])
+        query_plan = analyze_query(sanitized_q)
+        context = retrieve(sanitized_q, query_plan, index)
         draft_answer = generate_draft_answer(
-            question=q["question"],
+            question=sanitized_q,
             context=context,
             query_plan=query_plan,
         )
         answer = finalize_answer(
-            question=q["question"],
+            question=sanitized_q,
             context=context,
             query_plan=query_plan,
             draft_answer=draft_answer,
@@ -398,7 +427,7 @@ def run_pipeline(output_path: str = "submission.csv") -> None:
             token=q["token"],
         )
         answer_one_line = answer.replace("\n", " ")
-        print(f"Question: {q['question']}")
+        print(f"Question: {sanitized_q}")
         print(f"Answer: {answer_one_line}")
         print("-" * 80)
         print()
