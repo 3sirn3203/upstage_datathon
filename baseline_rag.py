@@ -253,11 +253,11 @@ def retrieve(question: str, query_plan: dict, index, top_k: int = 8) -> str:
     bm25_results = index["bm25_retriever"].search(keywords, top_k=bm25_top_k)
     dense_result_lists = index["dense_retriever"].search_many(subqueries, top_k=dense_top_k)
 
+    print("Stage 2: Retrieval results:")
     print(
-        "  [Retrieval] "
-        f"BM25={len(bm25_results)} candidates | "
-        f"Dense={sum(len(results) for results in dense_result_lists)} candidates "
-        f"from {len(dense_result_lists)} subqueries"
+        f"  BM25={len(bm25_results)} candidates | "
+        f"  Dense={sum(len(results) for results in dense_result_lists)} candidates "
+        f"  from {len(dense_result_lists)} subqueries \n"
     )
 
     merged_results = merge_retrieval_results(
