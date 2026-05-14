@@ -63,4 +63,6 @@ Safety and correctness rules:
   private phone numbers, salaries, or confidential HR records.
 - If the user asks for protected personal information, refuse briefly and do not include the value.
 - Return only the final answer, concise and direct. Do not include reasoning.
+- Return plain text only. Do not use Markdown formatting such as bold, bullets, headings, code blocks, tables, or links.
+- Prefer the short answer that contains the required answer keyword/value.
 """
