@@ -20,10 +20,16 @@ class MergeConfig:
     max_chunks_per_section: int = 2
     coverage_weight: float = 0.25
     doc_repeat_penalty: float = 0.10
+    iteration_decay: float = 1.0
+    missing_need_bonus: float = 0.0
+    cross_iteration_bonus: float = 0.0
+    min_followup_chunks: int = 0
 
 
 def config_from_dict(config: dict[str, Any]) -> MergeConfig:
-    merge = config.get("retrieval", {}).get("merge", {})
+    retrieval = config.get("retrieval", {})
+    merge = retrieval.get("merge", {})
+    iterative = retrieval.get("iterative", {})
     return MergeConfig(
         rrf_k=int(merge.get("rrf_k", 30)),
         max_candidates=int(merge.get("max_candidates", 40)),
@@ -31,6 +37,10 @@ def config_from_dict(config: dict[str, Any]) -> MergeConfig:
         max_chunks_per_section=int(merge.get("max_chunks_per_section", 2)),
         coverage_weight=float(merge.get("coverage_weight", 0.25)),
         doc_repeat_penalty=float(merge.get("doc_repeat_penalty", 0.10)),
+        iteration_decay=float(iterative.get("iteration_decay", 1.0)),
+        missing_need_bonus=float(iterative.get("missing_need_bonus", 0.0)),
+        cross_iteration_bonus=float(iterative.get("cross_iteration_bonus", 0.0)),
+        min_followup_chunks=int(iterative.get("min_followup_chunks", 0)),
     )
 
 
@@ -50,12 +60,13 @@ def merge_retrieval_results(
     if not candidates:
         return []
 
-    add_rrf_scores(candidates, merge_config.rrf_k)
-    add_base_scores(candidates)
+    add_rrf_scores(candidates, merge_config.rrf_k, merge_config.iteration_decay)
+    add_base_scores(candidates, merge_config)
     candidates.sort(key=lambda candidate: candidate["base_score"], reverse=True)
-    candidates = candidates[: merge_config.max_candidates]
+    candidates = retain_candidate_pool(candidates, merge_config)
 
     selected = coverage_aware_select(candidates, top_k, merge_config)
+    selected = ensure_min_followup_chunks(selected, candidates, top_k, merge_config)
     selected = order_for_generation(selected)
     return [candidate_to_result(candidate, rank) for rank, candidate in enumerate(selected, start=1)]
 
@@ -106,12 +117,12 @@ def add_result_list(
         candidate["best_score"] = max(float(candidate["best_score"]), float(result.get("score", 0.0)))
 
 
-def add_rrf_scores(candidates: list[dict[str, Any]], rrf_k: int) -> None:
+def add_rrf_scores(candidates: list[dict[str, Any]], rrf_k: int, iteration_decay: float = 1.0) -> None:
     rrf_values = []
     for candidate in candidates:
         rrf = sum(
-            1.0 / (rrf_k + info["rank"])
-            for info in candidate["retrieved_from"].values()
+            source_iteration_weight(source, iteration_decay) / (rrf_k + info["rank"])
+            for source, info in candidate["retrieved_from"].items()
         )
         candidate["rrf"] = rrf
         rrf_values.append(rrf)
@@ -124,32 +135,35 @@ def add_rrf_scores(candidates: list[dict[str, Any]], rrf_k: int) -> None:
 
 
 def overlap_features(candidate: dict[str, Any]) -> dict[str, Any]:
-    sources = candidate["retrieved_from"].keys()
-    dense_hits = [source for source in sources if source.startswith("dense:")]
-    has_bm25 = "bm25" in sources
+    sources = list(candidate["retrieved_from"].keys())
+    dense_hits = [source for source in sources if is_dense_source(source)]
+    has_bm25 = any(is_bm25_source(source) for source in sources)
+    matched_iterations = sorted({source_iteration(source) for source in sources})
     return {
         "hit_count": len(candidate["retrieved_from"]),
         "has_bm25": has_bm25,
         "dense_hit_count": len(dense_hits),
         "hybrid_overlap": has_bm25 and bool(dense_hits),
         "multi_dense_overlap": len(dense_hits) >= 2,
-        "original_query_hit": "dense:original" in sources,
+        "original_query_hit": any(is_original_dense_source(source) for source in sources),
+        "missing_need_hit": any(is_missing_need_source(source) for source in sources),
+        "followup_hit": any(iteration > 0 for iteration in matched_iterations),
+        "cross_iteration_hit": len(matched_iterations) >= 2,
+        "matched_iterations": matched_iterations,
     }
 
 
 def compute_covered_queries(candidate: dict[str, Any]) -> set[str]:
     covered = set()
     for source in candidate["retrieved_from"]:
-        if source == "bm25":
+        if is_bm25_source(source):
             covered.add("keyword")
-        elif source == "dense:original":
-            covered.add("original")
-        elif source.startswith("dense:"):
-            covered.add(source.replace("dense:", "", 1))
+        elif is_dense_source(source):
+            covered.add(dense_query_label(source))
     return covered
 
 
-def add_base_scores(candidates: list[dict[str, Any]]) -> None:
+def add_base_scores(candidates: list[dict[str, Any]], config: MergeConfig) -> None:
     for candidate in candidates:
         features = candidate["features"]
         dense_count = features["dense_hit_count"]
@@ -159,7 +173,41 @@ def add_base_scores(candidates: list[dict[str, Any]]) -> None:
             + 0.15 * min(dense_count / 3.0, 1.0)
             + 0.10 * float(features["original_query_hit"])
             + 0.10 * float(features["has_bm25"])
+            + config.missing_need_bonus * float(features["missing_need_hit"])
+            + config.cross_iteration_bonus * float(features["cross_iteration_hit"])
         )
+
+
+def retain_candidate_pool(candidates: list[dict[str, Any]], config: MergeConfig) -> list[dict[str, Any]]:
+    if len(candidates) <= config.max_candidates:
+        return candidates
+
+    retained = candidates[: config.max_candidates]
+    required_followups = min(
+        int(config.min_followup_chunks),
+        len({candidate_chunk_id(candidate) for candidate in candidates if candidate["features"]["followup_hit"]}),
+    )
+    if required_followups <= 0 or count_followup_chunks(retained) >= required_followups:
+        return retained
+
+    retained_ids = {candidate_chunk_id(candidate) for candidate in retained}
+    for candidate in candidates[config.max_candidates :]:
+        if count_followup_chunks(retained) >= required_followups:
+            break
+        if not candidate["features"]["followup_hit"]:
+            continue
+        candidate_id = candidate_chunk_id(candidate)
+        if candidate_id in retained_ids:
+            continue
+        replace_idx = find_followup_replacement_index(retained)
+        if replace_idx is None:
+            break
+        replaced_id = candidate_chunk_id(retained[replace_idx])
+        retained[replace_idx] = candidate
+        retained_ids.discard(replaced_id)
+        retained_ids.add(candidate_id)
+
+    return retained
 
 
 def coverage_aware_select(
@@ -188,6 +236,74 @@ def coverage_aware_select(
     return selected
 
 
+def ensure_min_followup_chunks(
+    selected: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    top_k: int,
+    config: MergeConfig,
+) -> list[dict[str, Any]]:
+    required = int(config.min_followup_chunks)
+    if required <= 0 or top_k <= 0:
+        return selected
+
+    followup_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.get("features", {}).get("followup_hit")
+    ]
+    if not followup_candidates:
+        return selected
+
+    required = min(required, len({candidate_chunk_id(candidate) for candidate in followup_candidates}))
+    selected_ids = {candidate_chunk_id(candidate) for candidate in selected}
+    followup_count = count_followup_chunks(selected)
+    if followup_count >= required:
+        return selected
+
+    ranked_followups = sorted(followup_candidates, key=lambda item: item["base_score"], reverse=True)
+    for candidate in ranked_followups:
+        if followup_count >= required:
+            break
+        candidate_id = candidate_chunk_id(candidate)
+        if candidate_id in selected_ids:
+            continue
+
+        if len(selected) < top_k and within_diversity_limits(candidate, selected, config):
+            selected.append(candidate)
+            selected_ids.add(candidate_id)
+            followup_count += 1
+            continue
+
+        replace_idx = find_followup_replacement_index(selected)
+        if replace_idx is None:
+            continue
+        trial_selected = selected[:replace_idx] + selected[replace_idx + 1 :]
+        if not within_diversity_limits(candidate, trial_selected, config):
+            continue
+        replaced_id = candidate_chunk_id(selected[replace_idx])
+        selected[replace_idx] = candidate
+        selected_ids.discard(replaced_id)
+        selected_ids.add(candidate_id)
+        followup_count += 1
+
+    return selected
+
+
+def count_followup_chunks(candidates: list[dict[str, Any]]) -> int:
+    return sum(1 for candidate in candidates if candidate.get("features", {}).get("followup_hit"))
+
+
+def find_followup_replacement_index(selected: list[dict[str, Any]]) -> int | None:
+    replaceable = [
+        (candidate.get("base_score", 0.0), idx)
+        for idx, candidate in enumerate(selected)
+        if not candidate.get("features", {}).get("followup_hit")
+    ]
+    if not replaceable:
+        return None
+    return min(replaceable)[1]
+
+
 def selection_score(
     candidate: dict[str, Any],
     selected: list[dict[str, Any]],
@@ -207,6 +323,8 @@ def selection_score(
 
 def query_weight(query: str) -> float:
     if query == "original":
+        return 1.0
+    if query.startswith("missing"):
         return 1.0
     if query == "keyword":
         return 0.8
@@ -274,3 +392,47 @@ def section_key(candidate: dict[str, Any]) -> tuple[str, int, str]:
         int(chunk.get("page") or 0),
         str(chunk.get("section", "")),
     )
+
+
+def candidate_chunk_id(candidate: dict[str, Any]) -> str:
+    return str(candidate.get("chunk", {}).get("chunk_id", ""))
+
+
+def source_iteration(source: str) -> int:
+    for part in str(source).split(":"):
+        if part.startswith("iter") and part[4:].isdigit():
+            return int(part[4:])
+    return 0
+
+
+def source_iteration_weight(source: str, decay: float) -> float:
+    iteration = source_iteration(source)
+    if iteration <= 0:
+        return 1.0
+    return max(float(decay), 0.0) ** iteration
+
+
+def is_bm25_source(source: str) -> bool:
+    return str(source).split(":")[-1] == "bm25"
+
+
+def is_dense_source(source: str) -> bool:
+    return "dense" in str(source).split(":")
+
+
+def dense_query_label(source: str) -> str:
+    parts = str(source).split(":")
+    if "dense" not in parts:
+        return "dense"
+    dense_idx = parts.index("dense")
+    if dense_idx + 1 >= len(parts):
+        return "dense"
+    return parts[dense_idx + 1]
+
+
+def is_original_dense_source(source: str) -> bool:
+    return is_dense_source(source) and dense_query_label(source) == "original"
+
+
+def is_missing_need_source(source: str) -> bool:
+    return is_dense_source(source) and dense_query_label(source).startswith("missing")

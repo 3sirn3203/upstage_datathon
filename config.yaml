@@ -49,6 +49,14 @@ retrieval:
   bm25_top_k: 30
   dense_top_k: 10
   final_top_k: 20
+  iterative:
+    enabled: true
+    # Maximum number of extra retrieval rounds after the initial retrieval.
+    max_iterations: 2
+    iteration_decay: 0.9
+    missing_need_bonus: 0.25
+    cross_iteration_bonus: 0.2
+    min_followup_chunks: 2
   merge:
     rrf_k: 30
     max_candidates: 40
@@ -68,6 +76,11 @@ llm:
     enabled: true
     temperature: 0
     max_tokens: 768
+  context_evaluation:
+    model: solar-pro
+    enabled: true
+    temperature: 0
+    max_tokens: 512
   final_generation:
     model: solar-pro
     temperature: 0
