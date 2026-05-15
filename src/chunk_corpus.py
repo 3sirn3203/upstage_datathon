@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from src.sanitizer import build_security_map, lookup_chunk_security
+
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -647,12 +649,12 @@ def enrich_record_from_raw(
             return enriched
     return record
 
-
 def chunk_corpus(
     pages_path: str | Path,
     *,
     output_path: str | Path | None = None,
     config: ChunkingConfig | None = None,
+    security_map: dict | None = None,
 ) -> Path:
     pages_path = Path(pages_path)
     chunking_config = config or ChunkingConfig()
@@ -661,6 +663,7 @@ def chunk_corpus(
     chunk_count = 0
     last_heading_by_source: dict[str, list[str]] = {}
     raw_cache: dict[str, list[dict[str, Any]]] = {}
+    
     with output.open("w", encoding="utf-8") as file:
         for record in load_pages(pages_path):
             record = enrich_record_from_raw(record, pages_dir=pages_path.parent, raw_cache=raw_cache)
@@ -673,6 +676,11 @@ def chunk_corpus(
             for chunk in chunks:
                 chunk_count += 1
                 chunk["global_sequence"] = chunk_count
+                
+                if security_map is not None:
+                    security_info = lookup_chunk_security(chunk, security_map)
+                    chunk["security"] = security_info
+
                 file.write(json.dumps(chunk, ensure_ascii=False) + "\n")
                 if chunk.get("heading_path"):
                     last_heading_by_source[source] = chunk["heading_path"]
@@ -708,10 +716,15 @@ def main() -> None:
 
     raw_config = load_config(args.config)
     pages_path = args.pages or default_pages_path(raw_config)
+    
+    corpus_dir = Path(r"distribution\corpus") 
+    security_map = build_security_map(corpus_dir)
+
     chunk_corpus(
         pages_path,
         output_path=args.output,
         config=config_from_dict(raw_config),
+        security_map=security_map,
     )
 
 
