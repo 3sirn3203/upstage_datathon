@@ -68,6 +68,16 @@ llm:
     enabled: true
     temperature: 0
     max_tokens: 768
+  fact_rows:
+    model: solar-pro
+    enabled: true
+    temperature: 0
+    max_tokens: 1024
+  confidence_check:
+    model: solar-pro
+    enabled: true
+    temperature: 0
+    max_tokens: 256
   final_generation:
     model: solar-pro
     temperature: 0
