@@ -158,7 +158,6 @@ def build_index(corpus_dir: str):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def sanitize_query(question: str) -> str:
-    # 1. 특정 문구 출력 강요 패턴 (주은님이 말씀하신 '적어라', '출력해라'의 영어 버전)
     # 문장 중간이나 끝에 "output/print/say/write [특정문구]"가 오는 경우를 차단합니다.
     imperative_patterns = [
         r"(?i)(must\s+)?(output|print|say|write|type|append|end\s+with)\s+['\"].*?['\"]",
