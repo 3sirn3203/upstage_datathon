@@ -255,7 +255,7 @@ def write_text_dump(records: list[dict[str, Any]], output_path: Path) -> None:
 
     output_path.write_text("\n".join(parts), encoding="utf-8")
 
-def split_pdf_by_pages(pdf_path: Path, chunk_size: int = 100):
+def split_pdf_by_pages(pdf_path: Path, chunk_size: int):
     reader = PdfReader(pdf_path)
     total_pages = len(reader.pages)
 
