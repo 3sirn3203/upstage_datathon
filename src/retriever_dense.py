@@ -14,8 +14,6 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable
 
-import faiss
-
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -40,6 +38,15 @@ class DenseRetriever:
         self.config = config or DenseIndexConfig()
         self.faiss_path = Path(faiss_path)
         self.metadata_path = Path(metadata_path)
+
+        try:
+            import faiss
+        except ImportError as exc:
+            raise ImportError(
+                "Dense retrieval requires faiss-cpu. Install project requirements or set "
+                "indexing.dense.enabled: false for BM25-only retrieval."
+            ) from exc
+
         self.index = faiss.read_index(str(self.faiss_path))
         self.metadata = load_metadata(self.metadata_path)
 

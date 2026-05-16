@@ -25,7 +25,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-import faiss
 import numpy as np
 
 
@@ -43,6 +42,7 @@ except ImportError:
 
 @dataclass
 class DenseIndexConfig:
+    enabled: bool = True
     model_name: str = "BAAI/bge-large-en-v1.5"
     dimension: int = 1024
     batch_size: int = 32
@@ -64,6 +64,7 @@ _MODEL_CACHE: dict[tuple[str, str, str], Any] = {}
 def config_from_dict(config: dict[str, Any]) -> DenseIndexConfig:
     dense = config.get("indexing", {}).get("dense", {})
     return DenseIndexConfig(
+        enabled=bool(dense.get("enabled", True)),
         model_name=str(dense.get("model_name", "BAAI/bge-large-en-v1.5")),
         dimension=int(dense.get("dimension", 1024)),
         batch_size=int(dense.get("batch_size", 32)),
@@ -232,6 +233,18 @@ def build_dense_index(
 ) -> dict[str, Path | int]:
     chunks_path = Path(chunks_path)
     dense_config = config or DenseIndexConfig()
+    if not dense_config.enabled:
+        log_block("Index Build", "Dense index skipped", "indexing.dense.enabled is false")
+        return {"num_vectors": 0}
+
+    try:
+        import faiss
+    except ImportError as exc:
+        raise ImportError(
+            "Dense indexing requires faiss-cpu. Install project requirements or set "
+            "indexing.dense.enabled: false for BM25-only retrieval."
+        ) from exc
+
     should_force = dense_config.force if force is None else force
     target_dir = Path(output_dir) if output_dir else chunks_path.parent
     target_dir.mkdir(parents=True, exist_ok=True)

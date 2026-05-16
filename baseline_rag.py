@@ -38,13 +38,16 @@ from src.prompt import (
     QUERY_ANALYSIS_PROMPT,
 )
 from src.retriever_bm25 import BM25Retriever, config_from_dict as bm25_config_from_dict
-from src.retriever_dense import DenseRetriever
 from src.retriever_merge import config_from_dict as merge_config_from_dict, merge_retrieval_results
 from validator import validate
 
 CORPUS_DIR      = "distribution/corpus"
 TEST_SUITE_PATH = "distribution/test_suite/Encrypted_Test_Suite.json"
 CONFIG          = load_config(DEFAULT_CONFIG_PATH)
+
+
+def dense_enabled() -> bool:
+    return bool(CONFIG.get("indexing", {}).get("dense", {}).get("enabled", True))
 
 
 def load_chunks(path: str | Path) -> list[dict]:
@@ -135,22 +138,26 @@ def build_index(corpus_dir: str):
     chunks = load_chunks(chunks_path)
     log_block("Index Build", "Chunk summary", f"Chunks: {len(chunks)}\nPath: {chunks_path}")
 
-    dense_index = build_dense_index(
-        chunks_path,
-        config=dense_config_from_dict(CONFIG),
-    )
-    log_block(
-        "Index Build",
-        "Retriever summary",
-        f"Dense index: {dense_index['faiss_path']}\nVectors: {dense_index['num_vectors']}",
-    )
-
     bm25_retriever = BM25Retriever(chunks, config=bm25_config_from_dict(CONFIG))
-    dense_retriever = DenseRetriever(
-        faiss_path=dense_index["faiss_path"],
-        metadata_path=dense_index["metadata_path"],
-        config=dense_config_from_dict(CONFIG),
-    )
+    dense_index = None
+    dense_retriever = None
+    if dense_enabled():
+        from src.retriever_dense import DenseRetriever
+
+        dense_index = build_dense_index(
+            chunks_path,
+            config=dense_config_from_dict(CONFIG),
+        )
+        dense_retriever = DenseRetriever(
+            faiss_path=dense_index["faiss_path"],
+            metadata_path=dense_index["metadata_path"],
+            config=dense_config_from_dict(CONFIG),
+        )
+        retriever_summary = f"Dense index: {dense_index['faiss_path']}\nVectors: {dense_index['num_vectors']}"
+    else:
+        retriever_summary = "Dense retrieval disabled by indexing.dense.enabled=false. Using BM25 only."
+
+    log_block("Index Build", "Retriever summary", retriever_summary)
 
     return {
         "parsed_path": parsed_path,
@@ -280,13 +287,14 @@ def retrieve_once(
     retrieval_config = CONFIG.get("retrieval", {})
     bm25_top_k = int(retrieval_config.get("bm25_top_k", 30))
     dense_top_k = int(retrieval_config.get("dense_top_k", 10))
+    use_dense = dense_enabled() and index.get("dense_retriever") is not None
 
     keywords = coerce_string_list(
         query_plan.get("keywords"),
         fallback=[question] if include_original else [],
         limit=20,
     )
-    subqueries = build_dense_queries(question, query_plan, include_original=include_original)
+    subqueries = build_dense_queries(question, query_plan, include_original=include_original) if use_dense else []
 
     bm25_results = annotate_retrieval_results(
         index["bm25_retriever"].search(keywords, top_k=bm25_top_k),
@@ -295,11 +303,12 @@ def retrieve_once(
     )
 
     dense_result_lists = []
-    for idx, subquery in enumerate(subqueries):
-        label = dense_label(iteration, idx, subquery, question, include_original, dense_label_prefix)
-        dense_result_lists.append(
-            index["dense_retriever"].search(subquery, top_k=dense_top_k, label=label)
-        )
+    if use_dense:
+        for idx, subquery in enumerate(subqueries):
+            label = dense_label(iteration, idx, subquery, question, include_original, dense_label_prefix)
+            dense_result_lists.append(
+                index["dense_retriever"].search(subquery, top_k=dense_top_k, label=label)
+            )
 
     log_block(
         "Stage 2",
@@ -307,6 +316,7 @@ def retrieve_once(
         "\n".join(
             [
                 f"BM25 candidates: {len(bm25_results)}",
+                f"Dense enabled: {use_dense}",
                 f"Dense candidates: {sum(len(results) for results in dense_result_lists)}",
                 f"Dense subqueries: {len(dense_result_lists)}",
                 f"BM25 chunk_ids: {format_result_chunk_ids(bm25_results)}",

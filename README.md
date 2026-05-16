@@ -1,6 +1,6 @@
 # Tech Starterkit RAG Pipeline
 
-PDF corpus를 파싱하고, chunking, dense FAISS index, BM25 + dense hybrid retrieval, Solar LLM generation을 거쳐 `submission.csv`를 생성하는 RAG 파이프라인입니다.
+PDF corpus를 파싱하고, chunking, BM25 retrieval, 선택적 dense FAISS retrieval, Solar LLM generation을 거쳐 `submission.csv`를 생성하는 RAG 파이프라인입니다.
 
 ## Setup
 
@@ -42,6 +42,7 @@ indexing:
     k1: 1.5
     b: 0.75
   dense:
+    enabled: true
     model_name: BAAI/bge-large-en-v1.5
     dimension: 1024
     batch_size: 32
@@ -52,6 +53,8 @@ retrieval:
   dense_top_k: 10
   final_top_k: 20
 ```
+
+`indexing.dense.enabled: false`로 바꾸면 FAISS index build와 dense query embedding을 건너뛰고 BM25 retrieval만 사용합니다.
 
 ## Pipeline
 
@@ -69,7 +72,7 @@ PDF corpus
 → chunk_corpus
 → index_corpus
 → query analysis
-→ BM25 + dense retrieval
+→ BM25 retrieval (+ dense retrieval when enabled)
 → merge retrieval results
 → draft generation
 → final safety generation via tracker.chat()
@@ -94,7 +97,7 @@ PDF corpus
   --output parsed_corpus/pdfplumber/chunks.jsonl
 ```
 
-FAISS dense index 생성:
+FAISS dense index 생성 (`indexing.dense.enabled: true`일 때만 필요):
 
 ```bash
 .venv/bin/python src/index_corpus.py \
@@ -110,7 +113,7 @@ BM25 검색 확인:
   --top-k 8
 ```
 
-Dense 검색 확인:
+Dense 검색 확인 (`indexing.dense.enabled: true`일 때만 사용):
 
 ```bash
 .venv/bin/python src/retriever_dense.py \
@@ -177,8 +180,8 @@ Query analysis 단계는 다음 JSON만 생성하도록 프롬프트되어 있�
 Retrieval 단계:
 
 1. `keywords`로 BM25 검색
-2. 원 질문 + `subqueries` 각각에 대해 dense 검색
-3. `retriever_merge.py`에서 provenance를 유지하며 merge
+2. `indexing.dense.enabled: true`이면 원 질문 + `subqueries` 각각에 대해 dense 검색
+3. `retriever_merge.py`에서 provenance를 유지하며 merge. Dense가 꺼져 있으면 BM25 결과만 merge
 4. 최종 20개 passage를 generation context로 구성
 
 Merge는 RRF, BM25/dense overlap, original query hit, subquery coverage, doc/section 반복 제한을 사용합니다.
