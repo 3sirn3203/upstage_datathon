@@ -25,9 +25,11 @@ from time import sleep
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
+from pypdf import PdfReader, PdfWriter
 
 import pdfplumber
 import yaml
+import tempfile
 
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
@@ -144,7 +146,6 @@ def call_upstage_document_parse(path: Path, config: dict[str, Any]) -> dict[str,
     response.raise_for_status()
     return response.json()
 
-
 def _extract_content(value: Any) -> str:
     if isinstance(value, str):
         return clean_text(value)
@@ -254,6 +255,27 @@ def write_text_dump(records: list[dict[str, Any]], output_path: Path) -> None:
 
     output_path.write_text("\n".join(parts), encoding="utf-8")
 
+def split_pdf_by_pages(pdf_path: Path, chunk_size: int = 100):
+    reader = PdfReader(pdf_path)
+    total_pages = len(reader.pages)
+
+    split_files = []
+
+    for start in range(0, total_pages, chunk_size):
+        writer = PdfWriter()
+        end = min(start + chunk_size, total_pages)
+
+        for i in range(start, end):
+            writer.add_page(reader.pages[i])
+
+        out_path = Path(tempfile.gettempdir()) / f"{pdf_path.stem}_{start}_{end}.pdf"
+
+        with open(out_path, "wb") as f:
+            writer.write(f)
+
+        split_files.append(out_path)
+
+    return split_files
 
 def parse_corpus(
     corpus_dir: str | Path | None = None,
@@ -308,13 +330,32 @@ def parse_corpus(
                         )
                     )
                 else:
-                    response = call_upstage_document_parse(pdf_path, parsing_config.get("upstage_api", {}))
+                    split_files = split_pdf_by_pages(pdf_path, chunk_size=100)
+
+                    all_records = []
+                    all_response = []
+
+                    for sub_pdf in split_files:
+                        print(f"  → parsing chunk: {sub_pdf.name}")
+
+                        response = call_upstage_document_parse(
+                            sub_pdf,
+                            parsing_config.get("upstage_api", {})
+                        )
+
+                        all_response.append(response)
+
+                        records = upstage_response_to_pages(sub_pdf.name, response)
+                        all_records.extend(records)
+
+                        sleep(2)
+
                     (raw_dir / f"{pdf_path.stem}.json").write_text(
-                        json.dumps(response, ensure_ascii=False, indent=2),
+                        json.dumps(all_response, ensure_ascii=False, indent=2),
                         encoding="utf-8",
                     )
-                    records = upstage_response_to_pages(pdf_path.name, response)
-                    sleep(2)
+
+                    records = all_records
 
                 total_pages += len(records)
                 for record in records:
