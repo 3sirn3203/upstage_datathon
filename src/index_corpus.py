@@ -6,7 +6,7 @@ Input:
 
 Outputs:
     parsed_corpus/<backend>/dense.faiss
-        FAISS IndexFlatIP over normalized Upstage passage embeddings.
+        FAISS IndexFlatIP over normalized local sentence-transformers embeddings.
 
     parsed_corpus/<backend>/dense_metadata.jsonl
         One metadata row per FAISS vector, preserving chunk fields except text is kept
@@ -20,9 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -45,35 +43,42 @@ except ImportError:
 
 @dataclass
 class DenseIndexConfig:
-    url: str = "https://api.upstage.ai/v1/solar/embeddings"
-    passage_model: str = "solar-embedding-1-large-passage"
-    query_model: str = "solar-embedding-1-large-query"
-    dimension: int = 4096
-    batch_size: int = 16
-    sleep_seconds: float = 1.0
-    max_retries: int = 5
-    retry_base_seconds: float = 2.0
+    model_name: str = "BAAI/bge-large-en-v1.5"
+    dimension: int = 1024
+    batch_size: int = 32
+    device: str = "auto"
+    query_instruction: str = "Represent this sentence for searching relevant passages: "
+    normalize_embeddings: bool = True
+    show_progress_bar: bool = True
+    max_seq_length: int = 512
     force: bool = False
     faiss_filename: str = "dense.faiss"
     metadata_filename: str = "dense_metadata.jsonl"
     embeddings_filename: str = "dense_embeddings.npy"
+    manifest_filename: str = "dense_manifest.json"
+
+
+_MODEL_CACHE: dict[tuple[str, str, str], Any] = {}
 
 
 def config_from_dict(config: dict[str, Any]) -> DenseIndexConfig:
     dense = config.get("indexing", {}).get("dense", {})
     return DenseIndexConfig(
-        url=str(dense.get("url", "https://api.upstage.ai/v1/solar/embeddings")),
-        passage_model=str(dense.get("passage_model", "solar-embedding-1-large-passage")),
-        query_model=str(dense.get("query_model", "solar-embedding-1-large-query")),
-        dimension=int(dense.get("dimension", 4096)),
-        batch_size=int(dense.get("batch_size", 16)),
-        sleep_seconds=float(dense.get("sleep_seconds", 1)),
-        max_retries=int(dense.get("max_retries", 5)),
-        retry_base_seconds=float(dense.get("retry_base_seconds", 2)),
+        model_name=str(dense.get("model_name", "BAAI/bge-large-en-v1.5")),
+        dimension=int(dense.get("dimension", 1024)),
+        batch_size=int(dense.get("batch_size", 32)),
+        device=str(dense.get("device", "auto")),
+        query_instruction=str(
+            dense.get("query_instruction", "Represent this sentence for searching relevant passages: ")
+        ),
+        normalize_embeddings=bool(dense.get("normalize_embeddings", True)),
+        show_progress_bar=bool(dense.get("show_progress_bar", True)),
+        max_seq_length=int(dense.get("max_seq_length", 512)),
         force=bool(dense.get("force", False)),
         faiss_filename=str(dense.get("faiss_filename", "dense.faiss")),
         metadata_filename=str(dense.get("metadata_filename", "dense_metadata.jsonl")),
         embeddings_filename=str(dense.get("embeddings_filename", "dense_embeddings.npy")),
+        manifest_filename=str(dense.get("manifest_filename", "dense_manifest.json")),
     )
 
 
@@ -104,71 +109,65 @@ def load_chunks(path: Path) -> list[dict[str, Any]]:
     return chunks
 
 
-def embed_texts(texts: list[str], model: str, config: DenseIndexConfig) -> np.ndarray:
-    api_key = os.environ.get("UPSTAGE_API_KEY")
-    if not api_key:
-        raise EnvironmentError("UPSTAGE_API_KEY is required to call the embedding API.")
+def embed_passages(texts: list[str], config: DenseIndexConfig) -> np.ndarray:
+    return embed_texts(texts, config)
 
+
+def embed_queries(queries: list[str], config: DenseIndexConfig) -> np.ndarray:
+    instruction = config.query_instruction
+    texts = [f"{instruction}{query}" if instruction else query for query in queries]
+    return embed_texts(texts, config)
+
+
+def embed_texts(texts: list[str], config: DenseIndexConfig) -> np.ndarray:
     if not texts:
         return np.empty((0, config.dimension), dtype=np.float32)
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    vectors: list[list[float]] = []
+    model = load_embedding_model(config)
+    matrix = model.encode(
+        texts,
+        batch_size=config.batch_size,
+        normalize_embeddings=config.normalize_embeddings,
+        convert_to_numpy=True,
+        show_progress_bar=config.show_progress_bar and len(texts) > config.batch_size,
+    ).astype(np.float32, copy=False)
 
-    for start in range(0, len(texts), config.batch_size):
-        batch = texts[start : start + config.batch_size]
-        response = post_embedding_batch(
-            url=config.url,
-            headers=headers,
-            payload={"input": batch, "model": model},
-            max_retries=config.max_retries,
-            retry_base_seconds=config.retry_base_seconds,
+    if matrix.ndim == 1:
+        matrix = matrix.reshape(1, -1)
+    if matrix.ndim != 2:
+        raise RuntimeError(f"Expected a 2D embedding matrix, got shape {matrix.shape}")
+    if config.dimension > 0 and matrix.shape[1] != config.dimension:
+        raise RuntimeError(
+            f"Expected embedding dimension {config.dimension} for {config.model_name}, got {matrix.shape[1]}"
         )
-        data = response.get("data", [])
-        if len(data) != len(batch):
-            raise RuntimeError(f"Embedding API returned {len(data)} vectors for {len(batch)} inputs")
-        vectors.extend(item["embedding"] for item in data)
-
-        if start + config.batch_size < len(texts) and config.sleep_seconds > 0:
-            time.sleep(config.sleep_seconds)
-
-    matrix = np.array(vectors, dtype=np.float32)
-    if matrix.ndim != 2 or matrix.shape[1] != config.dimension:
-        raise RuntimeError(f"Expected embedding dimension {config.dimension}, got shape {matrix.shape}")
     return matrix
 
 
-def post_embedding_batch(
-    *,
-    url: str,
-    headers: dict[str, str],
-    payload: dict[str, Any],
-    max_retries: int,
-    retry_base_seconds: float,
-) -> dict[str, Any]:
-    import requests
+def load_embedding_model(config: DenseIndexConfig) -> Any:
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as exc:
+        raise ImportError(
+            "Local dense retrieval requires sentence-transformers. "
+            "Install project requirements before building or querying the dense index."
+        ) from exc
 
-    for attempt in range(max_retries + 1):
-        response = requests.post(url, headers=headers, json=payload, timeout=120)
-        if response.status_code == 200:
-            return response.json()
+    device = resolved_device(config.device)
+    cache_key = (config.model_name, device or "auto", str(config.max_seq_length))
+    if cache_key not in _MODEL_CACHE:
+        kwargs = {"device": device} if device else {}
+        model = SentenceTransformer(config.model_name, **kwargs)
+        if config.max_seq_length > 0:
+            model.max_seq_length = config.max_seq_length
+        _MODEL_CACHE[cache_key] = model
+    return _MODEL_CACHE[cache_key]
 
-        retryable = response.status_code in {408, 409, 425, 429, 500, 502, 503, 504}
-        if not retryable or attempt >= max_retries:
-            raise RuntimeError(f"Embedding API error [{response.status_code}]: {response.text}")
 
-        retry_after = response.headers.get("Retry-After")
-        if retry_after:
-            sleep_seconds = float(retry_after)
-        else:
-            sleep_seconds = retry_base_seconds * (2**attempt)
-        time.sleep(sleep_seconds)
-
-    raise RuntimeError("Embedding API retry loop exhausted unexpectedly")
+def resolved_device(device: str) -> str | None:
+    value = str(device or "").strip()
+    if not value or value.lower() == "auto":
+        return None
+    return value
 
 
 def normalize_embeddings(matrix: np.ndarray) -> np.ndarray:
@@ -187,6 +186,43 @@ def write_metadata(path: Path, chunks: list[dict[str, Any]]) -> None:
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def write_manifest(path: Path, chunks_path: Path, config: DenseIndexConfig, vector_count: int, dimension: int) -> None:
+    manifest = {
+        "embedding_backend": "sentence-transformers",
+        "model_name": config.model_name,
+        "dimension": dimension,
+        "normalize_embeddings": config.normalize_embeddings,
+        "query_instruction": config.query_instruction,
+        "max_seq_length": config.max_seq_length,
+        "chunks_path": str(chunks_path),
+        "chunk_count": count_jsonl(chunks_path),
+        "vector_count": vector_count,
+    }
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def cache_matches(path: Path, chunks_path: Path, config: DenseIndexConfig) -> bool:
+    if not path.exists():
+        return False
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest_dimension = int(manifest.get("dimension", 0))
+        manifest_max_seq_length = int(manifest.get("max_seq_length", 0))
+        manifest_chunk_count = int(manifest.get("chunk_count", -1))
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        return False
+
+    return (
+        manifest.get("embedding_backend") == "sentence-transformers"
+        and manifest.get("model_name") == config.model_name
+        and manifest_dimension == config.dimension
+        and bool(manifest.get("normalize_embeddings")) == config.normalize_embeddings
+        and str(manifest.get("query_instruction", "")) == config.query_instruction
+        and manifest_max_seq_length == config.max_seq_length
+        and manifest_chunk_count == count_jsonl(chunks_path)
+    )
+
+
 def build_dense_index(
     chunks_path: str | Path,
     *,
@@ -203,11 +239,13 @@ def build_dense_index(
     faiss_path = target_dir / dense_config.faiss_filename
     metadata_path = target_dir / dense_config.metadata_filename
     embeddings_path = target_dir / dense_config.embeddings_filename
+    manifest_path = target_dir / dense_config.manifest_filename
 
     if (
         faiss_path.exists()
         and metadata_path.exists()
         and embeddings_path.exists()
+        and cache_matches(manifest_path, chunks_path, dense_config)
         and count_jsonl(chunks_path) == count_jsonl(metadata_path)
         and not should_force
     ):
@@ -220,6 +258,7 @@ def build_dense_index(
             "faiss_path": faiss_path,
             "metadata_path": metadata_path,
             "embeddings_path": embeddings_path,
+            "manifest_path": manifest_path,
             "num_vectors": count_jsonl(metadata_path),
         }
 
@@ -228,17 +267,17 @@ def build_dense_index(
     log_block(
         "Index Build",
         "Dense embedding",
-        f"Chunks: {len(texts)}\nModel: {dense_config.passage_model}",
+        f"Chunks: {len(texts)}\nModel: {dense_config.model_name}\nDevice: {dense_config.device}",
     )
-    embeddings = embed_texts(texts, dense_config.passage_model, dense_config)
-    embeddings = normalize_embeddings(embeddings)
+    embeddings = embed_passages(texts, dense_config)
 
-    index = faiss.IndexFlatIP(dense_config.dimension)
+    index = faiss.IndexFlatIP(int(embeddings.shape[1]))
     index.add(embeddings)
 
     faiss.write_index(index, str(faiss_path))
     np.save(embeddings_path, embeddings)
     write_metadata(metadata_path, chunks)
+    write_manifest(manifest_path, chunks_path, dense_config, int(index.ntotal), int(embeddings.shape[1]))
 
     log_block(
         "Index Build",
@@ -248,6 +287,7 @@ def build_dense_index(
                 f"FAISS index: {faiss_path}",
                 f"Metadata: {metadata_path}",
                 f"Embeddings: {embeddings_path}",
+                f"Manifest: {manifest_path}",
                 f"Vectors: {index.ntotal}",
             ]
         ),
@@ -256,6 +296,7 @@ def build_dense_index(
         "faiss_path": faiss_path,
         "metadata_path": metadata_path,
         "embeddings_path": embeddings_path,
+        "manifest_path": manifest_path,
         "num_vectors": int(index.ntotal),
     }
 

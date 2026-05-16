@@ -11,7 +11,7 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-API key는 환경변수로 설정합니다.
+Solar LLM 호출용 API key는 환경변수로 설정합니다. Dense embedding은 로컬 BGE 모델을 사용합니다.
 
 ```bash
 export UPSTAGE_API_KEY=<your_upstage_key>
@@ -19,10 +19,11 @@ export HACKATHON_KEY=<hackathon_key>   # 대회 당일 실제 test suite 복호�
 ```
 
 `HACKATHON_KEY`가 없으면 `decryptor.py`의 더미 질문으로 실행됩니다.
+로컬 dense embedding 모델(`BAAI/bge-large-en-v1.5`)은 첫 dense index build 때 Hugging Face cache로 다운로드됩니다.
 
 ## Config
 
-주요 설정은 [config.yaml](/Users/woojin/project/2026/tech-starterkit/config.yaml)에서 관리합니다.
+주요 설정은 [config.yaml](/Users/jseui/Desktop/hackathon/tech-starterkit/config.yaml)에서 관리합니다.
 
 ```yaml
 parsing:
@@ -41,8 +42,10 @@ indexing:
     k1: 1.5
     b: 0.75
   dense:
-    passage_model: solar-embedding-1-large-passage
-    query_model: solar-embedding-1-large-query
+    model_name: BAAI/bge-large-en-v1.5
+    dimension: 1024
+    batch_size: 32
+    query_instruction: "Represent this sentence for searching relevant passages: "
 
 retrieval:
   bm25_top_k: 30
@@ -127,6 +130,7 @@ parsed_corpus/
     dense.faiss
     dense_metadata.jsonl
     dense_embeddings.npy
+    dense_manifest.json
     text/*.txt
 ```
 
@@ -138,6 +142,7 @@ parsed_corpus/
 - `dense.faiss`: normalized passage embedding FAISS index
 - `dense_metadata.jsonl`: FAISS vector id와 chunk metadata 매핑
 - `dense_embeddings.npy`: normalized embedding matrix
+- `dense_manifest.json`: dense index를 만든 로컬 모델/차원/chunk count 기록
 
 ## Source Layout
 
@@ -151,9 +156,9 @@ validator.py                 # submission.csv schema validation
 src/
   parse_corpus.py            # pdfplumber PDF parser
   chunk_corpus.py            # fixed-size page chunking
-  index_corpus.py            # Upstage embedding + FAISS index build
+  index_corpus.py            # local BGE embedding + FAISS index build
   retriever_bm25.py          # in-memory BM25 retriever
-  retriever_dense.py         # query embedding + FAISS dense retriever
+  retriever_dense.py         # local query embedding + FAISS dense retriever
   retriever_merge.py         # BM25/dense merge strategy
   prompt.py                  # LLM prompts
 ```

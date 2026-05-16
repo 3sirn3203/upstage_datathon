@@ -1,7 +1,7 @@
 """
 retriever_dense.py — FAISS dense retriever for query subqueries.
 
-Each subquery is embedded with the Upstage query embedding model, searched
+Each subquery is embedded with the configured local embedding model, searched
 against the prebuilt FAISS index, and returned as its own ranked result list.
 Hybrid merging is intentionally left to baseline_rag.py.
 """
@@ -22,10 +22,10 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 try:
-    from .index_corpus import DenseIndexConfig, config_from_dict, embed_texts, normalize_embeddings
+    from .index_corpus import DenseIndexConfig, config_from_dict, embed_queries
     from .parse_corpus import DEFAULT_CONFIG_PATH, load_config
 except ImportError:
-    from index_corpus import DenseIndexConfig, config_from_dict, embed_texts, normalize_embeddings
+    from index_corpus import DenseIndexConfig, config_from_dict, embed_queries
     from parse_corpus import DEFAULT_CONFIG_PATH, load_config
 
 
@@ -43,6 +43,11 @@ class DenseRetriever:
         self.index = faiss.read_index(str(self.faiss_path))
         self.metadata = load_metadata(self.metadata_path)
 
+        if self.config.dimension > 0 and self.index.d != self.config.dimension:
+            raise ValueError(
+                f"FAISS dimension ({self.index.d}) does not match configured embedding dimension "
+                f"({self.config.dimension}) for {self.config.model_name}"
+            )
         if self.index.ntotal != len(self.metadata):
             raise ValueError(
                 f"FAISS vectors ({self.index.ntotal}) and metadata rows ({len(self.metadata)}) differ"
@@ -53,8 +58,7 @@ class DenseRetriever:
         if not query or top_k <= 0:
             return []
 
-        query_vector = embed_texts([query], self.config.query_model, self.config)
-        query_vector = normalize_embeddings(query_vector)
+        query_vector = embed_queries([query], self.config)
         scores, ids = self.index.search(query_vector, min(top_k, self.index.ntotal))
 
         results = []

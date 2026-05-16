@@ -20,19 +20,19 @@ indexing:
     b: 0.75
     top_k: 30
   dense:
-    provider: upstage
-    url: https://api.upstage.ai/v1/solar/embeddings
-    passage_model: solar-embedding-1-large-passage
-    query_model: solar-embedding-1-large-query
-    dimension: 4096
-    batch_size: 16
-    sleep_seconds: 1
-    max_retries: 5
-    retry_base_seconds: 2
+    model_name: BAAI/bge-large-en-v1.5
+    dimension: 1024
+    batch_size: 32
+    device: auto
+    query_instruction: "Represent this sentence for searching relevant passages: "
+    normalize_embeddings: true
+    show_progress_bar: true
+    max_seq_length: 512
     force: false
     faiss_filename: dense.faiss
     metadata_filename: dense_metadata.jsonl
     embeddings_filename: dense_embeddings.npy
+    manifest_filename: dense_manifest.json
 
 retrieval:
   bm25_top_k: 30
