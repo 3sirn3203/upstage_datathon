@@ -28,7 +28,6 @@ import urllib.request
 from decryptor import load_test_suite
 from upstage_tracker import DEFAULT_MODEL, UPSTAGE_BASE_URL, UpstageTracker
 from src.chunk_corpus import chunk_corpus, config_from_dict
-from src.detect_poisoning import build_suspicion_map
 from src.index_corpus import build_dense_index, config_from_dict as dense_config_from_dict
 from src.logging_utils import log_block
 from src.parse_corpus import DEFAULT_CONFIG_PATH, load_config, parse_corpus
@@ -129,9 +128,6 @@ def build_index(corpus_dir: str):
     )
     log_block("Index Build", "Parse selected", f"pdfplumber pages: {parsed_path}")
 
-    suspicion_map = build_suspicion_map(corpus_dir)
-    log_poisoning_suspicion_map(suspicion_map)
-
     chunks_path = chunk_corpus(
         parsed_path,
         config=config_from_dict(CONFIG),
@@ -158,29 +154,12 @@ def build_index(corpus_dir: str):
 
     return {
         "parsed_path": parsed_path,
-        "suspicion_map": suspicion_map,
         "chunks_path": chunks_path,
         "chunks": chunks,
         "dense": dense_index,
         "bm25_retriever": bm25_retriever,
         "dense_retriever": dense_retriever,
     }
-
-
-def log_poisoning_suspicion_map(suspicion_map: dict[str, dict[int, list[dict]]]) -> None:
-    if not suspicion_map:
-        log_block("Safety Scan", "pdfplumber anomaly detection", "No suspicious hidden text found")
-        return
-
-    lines = []
-    for source, pages in sorted(suspicion_map.items()):
-        for page, findings in sorted(pages.items()):
-            hidden_text = "".join(finding.get("text", "") for finding in findings)
-            lines.append(
-                f"{source} page {page}\n"
-                f"{hidden_text}"
-            )
-    log_block("Safety Scan", "pdfplumber anomaly detection", "\n".join(lines))
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
