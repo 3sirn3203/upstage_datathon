@@ -31,6 +31,7 @@ from src.chunk_corpus import chunk_corpus, config_from_dict
 from src.index_corpus import build_dense_index, config_from_dict as dense_config_from_dict
 from src.logging_utils import log_block
 from src.parse_corpus import DEFAULT_CONFIG_PATH, load_config, parse_corpus
+from src.attack_sanitizer import sanitize_retrieval_results
 from src.prompt import (
     CONTEXT_EVALUATION_PROMPT,
     DRAFT_GENERATION_PROMPT,
@@ -370,13 +371,21 @@ def merge_accumulated_retrieval_results(
         bm25_results.extend(run["bm25_results"])
         dense_result_lists.extend(run["dense_result_lists"])
 
-    return merge_retrieval_results(
+    merged_results = merge_retrieval_results(
         bm25_results=bm25_results,
         dense_result_lists=dense_result_lists,
         top_k=final_top_k,
         query_plan=query_plan,
         config=merge_config_from_dict(CONFIG),
     )
+    sanitized_results, removed_count = sanitize_retrieval_results(merged_results)
+    if removed_count:
+        log_block(
+            "Safety Scan",
+            "Removed retrieved attack messages",
+            f"Removed {removed_count} attack message block(s) before context generation.",
+        )
+    return sanitized_results
 
 
 def build_dense_queries(question: str, query_plan: dict, *, include_original: bool) -> list[str]:
