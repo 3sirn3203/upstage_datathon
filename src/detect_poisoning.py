@@ -93,8 +93,6 @@ def scan_corpus(corpus_dir: str | Path) -> list[dict]:
     all_findings: list[dict] = []
     for pdf_path in sorted(corpus_path.glob("*.pdf")):
         findings = scan_pdf(pdf_path)
-        if findings:
-            print(f"[detect_poisoning] {pdf_path.name}: {len(findings)} suspicious chars found")
         all_findings.extend(findings)
     return all_findings
 

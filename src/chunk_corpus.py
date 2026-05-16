@@ -34,8 +34,10 @@ if str(ROOT_DIR) not in sys.path:
 
 try:
     from .parse_corpus import DEFAULT_CONFIG_PATH, load_config, upstage_response_to_pages  # type: ignore
+    from .logging_utils import log_block  # type: ignore
 except ImportError:
     from parse_corpus import DEFAULT_CONFIG_PATH, load_config, upstage_response_to_pages  # type: ignore
+    from logging_utils import log_block  # type: ignore
 
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
@@ -677,7 +679,11 @@ def chunk_corpus(
                 if chunk.get("heading_path"):
                     last_heading_by_source[source] = chunk["heading_path"]
 
-    print(f"[chunk_corpus] wrote {chunk_count} chunks to {output}")
+    log_block(
+        "Index Build",
+        "Chunk corpus",
+        f"Chunks: {chunk_count}\nOutput: {output}",
+    )
     return output
 
 

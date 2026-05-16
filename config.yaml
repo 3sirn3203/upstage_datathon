@@ -2,8 +2,6 @@ corpus:
   dir: distribution/corpus
 
 parsing:
-  # Supported options: pdfplumber, upstage_api
-  backend: upstage_api
   output_dir: parsed_corpus
   force: false
 

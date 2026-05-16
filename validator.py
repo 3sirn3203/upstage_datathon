@@ -12,6 +12,8 @@ import sys
 import os
 import pandas as pd
 
+from src.logging_utils import log_block
+
 REQUIRED_COLUMNS = {"question_id", "answer", "used_tokens", "inference_time", "token"}
 QID_PATTERN = r"^Q_\d{3,}$"
 
@@ -31,7 +33,7 @@ def validate(path: str = "submission.csv") -> bool:
 
     # ── 1. 파일 존재 여부 ────────────────────────────────────────────────
     if not os.path.exists(path):
-        print(f"[ERROR] 파일을 찾을 수 없습니다: {path}")
+        log_block("Validation", "File missing", f"Path: {path}")
         return False
 
     # ── 2. UTF-8 인코딩 로드 ─────────────────────────────────────────────
@@ -105,26 +107,25 @@ def validate(path: str = "submission.csv") -> bool:
 
 
 def _print_result(errors: list, warnings: list, df_len: int = None) -> None:
-    print("=" * 55)
-    print("  submission.csv 검증 결과")
-    print("=" * 55)
+    lines = []
 
     if df_len is not None:
-        print(f"  총 행 수: {df_len}개\n")
+        lines.append(f"Rows: {df_len}")
 
     if errors:
-        print(f"  [FAIL] 오류 {len(errors)}건")
+        lines.append(f"Status: FAIL ({len(errors)} errors)")
         for e in errors:
-            print(f"    ✗ {e}")
+            lines.append(f"- {e}")
     else:
-        print("  [PASS] 스키마 검사 통과 — 제출 가능합니다.")
+        lines.append("Status: PASS")
+        lines.append("Schema validation passed.")
 
     if warnings:
-        print(f"\n  [WARN] 경고 {len(warnings)}건")
+        lines.append(f"Warnings: {len(warnings)}")
         for w in warnings:
-            print(f"    △ {w}")
+            lines.append(f"- {w}")
 
-    print("=" * 55)
+    log_block("Validation", "submission.csv", "\n".join(lines))
 
 
 if __name__ == "__main__":

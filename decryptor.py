@@ -30,6 +30,8 @@ import os
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from src.logging_utils import log_block
+
 # ---------------------------------------------------------------------------
 # 샘플 더미 데이터 (개발/테스트용)
 # ---------------------------------------------------------------------------
@@ -112,7 +114,7 @@ def load_test_suite(path: str = "Encrypted_Test_Suite.json") -> list[dict]:
             reasons.append(f"{path} 파일 없음")
         if not key:
             reasons.append("HACKATHON_KEY 환경변수 미설정")
-        print(f"[decryptor] 샘플 데이터로 실행합니다. ({', '.join(reasons)})")
+        log_block("Question Load", "Sample suite fallback", ", ".join(reasons))
         return _DUMMY_SUITE
 
     with open(path, encoding="utf-8") as f:

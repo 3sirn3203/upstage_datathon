@@ -37,8 +37,10 @@ if str(ROOT_DIR) not in sys.path:
 
 try:
     from .parse_corpus import DEFAULT_CONFIG_PATH, load_config  # type: ignore
+    from .logging_utils import log_block  # type: ignore
 except ImportError:
     from parse_corpus import DEFAULT_CONFIG_PATH, load_config  # type: ignore
+    from logging_utils import log_block  # type: ignore
 
 
 @dataclass
@@ -209,7 +211,11 @@ def build_dense_index(
         and count_jsonl(chunks_path) == count_jsonl(metadata_path)
         and not should_force
     ):
-        print(f"[index_corpus] using cached dense index: {faiss_path}")
+        log_block(
+            "Index Build",
+            "Dense index cache hit",
+            f"FAISS index: {faiss_path}\nVectors: {count_jsonl(metadata_path)}",
+        )
         return {
             "faiss_path": faiss_path,
             "metadata_path": metadata_path,
@@ -219,7 +225,11 @@ def build_dense_index(
 
     chunks = load_chunks(chunks_path)
     texts = [chunk["text"] for chunk in chunks]
-    print(f"[index_corpus] embedding {len(texts)} chunks with {dense_config.passage_model}")
+    log_block(
+        "Index Build",
+        "Dense embedding",
+        f"Chunks: {len(texts)}\nModel: {dense_config.passage_model}",
+    )
     embeddings = embed_texts(texts, dense_config.passage_model, dense_config)
     embeddings = normalize_embeddings(embeddings)
 
@@ -230,9 +240,18 @@ def build_dense_index(
     np.save(embeddings_path, embeddings)
     write_metadata(metadata_path, chunks)
 
-    print(f"[index_corpus] wrote FAISS index: {faiss_path} ({index.ntotal} vectors)")
-    print(f"[index_corpus] wrote metadata: {metadata_path}")
-    print(f"[index_corpus] wrote embeddings: {embeddings_path}")
+    log_block(
+        "Index Build",
+        "Dense index completed",
+        "\n".join(
+            [
+                f"FAISS index: {faiss_path}",
+                f"Metadata: {metadata_path}",
+                f"Embeddings: {embeddings_path}",
+                f"Vectors: {index.ntotal}",
+            ]
+        ),
+    )
     return {
         "faiss_path": faiss_path,
         "metadata_path": metadata_path,

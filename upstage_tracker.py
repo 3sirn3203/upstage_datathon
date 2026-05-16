@@ -21,6 +21,8 @@ import urllib.request
 import urllib.error
 import pandas as pd
 
+from src.logging_utils import log_block
+
 
 UPSTAGE_BASE_URL = "https://api.upstage.ai/v1"
 DEFAULT_MODEL    = "solar-mini"
@@ -38,10 +40,10 @@ class UpstageTracker:
         self.records: list[dict] = []
 
         if not self.api_key:
-            print(
-                "[UpstageTracker] 경고: UPSTAGE_API_KEY 환경변수가 설정되지 않았습니다.\n"
-                "  export UPSTAGE_API_KEY=<your_key>  또는\n"
-                "  UpstageTracker(api_key='...') 로 설정하세요."
+            log_block(
+                "Environment",
+                "Missing UPSTAGE_API_KEY",
+                "Set UPSTAGE_API_KEY or pass UpstageTracker(api_key='...').",
             )
 
     # ── Upstage API 직접 호출 ────────────────────────────────────────────
@@ -107,7 +109,7 @@ class UpstageTracker:
     def save_csv(self, path: str = "submission.csv") -> None:
         """기록된 모든 결과를 submission.csv로 저장합니다."""
         if not self.records:
-            print("[UpstageTracker] 저장할 기록이 없습니다.")
+            log_block("Submission", "Save skipped", "No records to save.")
             return
 
         df = pd.DataFrame(self.records)[
@@ -117,9 +119,10 @@ class UpstageTracker:
 
         median_time = df["inference_time"].median()
         total_tok   = df["used_tokens"].sum()
-        print(
-            f"[UpstageTracker] {path} 저장 완료\n"
-            f"  기록 수: {len(df)}개 | 중간값 응답: {median_time:.2f}초 | 총 토큰: {total_tok:,}"
+        log_block(
+            "Submission",
+            "CSV saved",
+            f"Path: {path}\nRecords: {len(df)}\nMedian response: {median_time:.2f}s\nTotal tokens: {total_tok:,}",
         )
 
     # ── 내부 HTTP 호출 ───────────────────────────────────────────────────

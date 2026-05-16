@@ -28,7 +28,9 @@ import urllib.request
 from decryptor import load_test_suite
 from upstage_tracker import DEFAULT_MODEL, UPSTAGE_BASE_URL, UpstageTracker
 from src.chunk_corpus import chunk_corpus, config_from_dict
+from src.detect_poisoning import build_suspicion_map
 from src.index_corpus import build_dense_index, config_from_dict as dense_config_from_dict
+from src.logging_utils import log_block
 from src.parse_corpus import DEFAULT_CONFIG_PATH, load_config, parse_corpus
 from src.prompt import (
     CONTEXT_EVALUATION_PROMPT,
@@ -120,25 +122,41 @@ def build_index(corpus_dir: str):
     parsing_config = CONFIG.get("parsing", {})
     parsed_path = parse_corpus(
         corpus_dir=corpus_dir,
-        option=parsing_config.get("backend", "pdfplumber"),
+        option="upstage_api",
         output_dir=parsing_config.get("output_dir", "parsed_corpus"),
         config_path=DEFAULT_CONFIG_PATH,
         force=parsing_config.get("force", False),
     )
-    print(f"  → parsed corpus: {parsed_path}")
+    log_block("Index Build", "Primary parse selected", f"Upstage pages: {parsed_path}")
+
+    pdfplumber_parsed_path = parse_corpus(
+        corpus_dir=corpus_dir,
+        option="pdfplumber",
+        output_dir=parsing_config.get("output_dir", "parsed_corpus"),
+        config_path=DEFAULT_CONFIG_PATH,
+        force=parsing_config.get("force", False),
+    )
+    log_block("Index Build", "Side parse completed", f"pdfplumber pages: {pdfplumber_parsed_path}")
+
+    suspicion_map = build_suspicion_map(corpus_dir)
+    log_poisoning_suspicion_map(suspicion_map)
 
     chunks_path = chunk_corpus(
         parsed_path,
         config=config_from_dict(CONFIG),
     )
     chunks = load_chunks(chunks_path)
-    print(f"  → chunks: {chunks_path} ({len(chunks)} chunks)")
+    log_block("Index Build", "Chunk summary", f"Chunks: {len(chunks)}\nPath: {chunks_path}")
 
     dense_index = build_dense_index(
         chunks_path,
         config=dense_config_from_dict(CONFIG),
     )
-    print(f"  → dense index: {dense_index['faiss_path']} ({dense_index['num_vectors']} vectors)")
+    log_block(
+        "Index Build",
+        "Retriever summary",
+        f"Dense index: {dense_index['faiss_path']}\nVectors: {dense_index['num_vectors']}",
+    )
 
     bm25_retriever = BM25Retriever(chunks, config=bm25_config_from_dict(CONFIG))
     dense_retriever = DenseRetriever(
@@ -149,12 +167,30 @@ def build_index(corpus_dir: str):
 
     return {
         "parsed_path": parsed_path,
+        "pdfplumber_parsed_path": pdfplumber_parsed_path,
+        "suspicion_map": suspicion_map,
         "chunks_path": chunks_path,
         "chunks": chunks,
         "dense": dense_index,
         "bm25_retriever": bm25_retriever,
         "dense_retriever": dense_retriever,
     }
+
+
+def log_poisoning_suspicion_map(suspicion_map: dict[str, dict[int, list[dict]]]) -> None:
+    if not suspicion_map:
+        log_block("Safety Scan", "pdfplumber anomaly detection", "No suspicious hidden text found")
+        return
+
+    lines = []
+    for source, pages in sorted(suspicion_map.items()):
+        for page, findings in sorted(pages.items()):
+            hidden_text = "".join(finding.get("text", "") for finding in findings)
+            lines.append(
+                f"{source} page {page}\n"
+                f"{hidden_text}"
+            )
+    log_block("Safety Scan", "pdfplumber anomaly detection", "\n".join(lines))
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -179,11 +215,18 @@ def analyze_query(question: str) -> dict:
     )
     try:
         parsed = json.loads(extract_json_object(content))
-        print(f"Stage 1: Query analysis output:")
-        print(json.dumps(parsed, ensure_ascii=False, indent=2))
+        log_block(
+            "Stage 1",
+            "Query analysis",
+            json.dumps(parsed, ensure_ascii=False, indent=2),
+        )
     except (json.JSONDecodeError, ValueError):
         parsed = fallback
-        print(f"Stage 1 - Query analysis failed to parse JSON. Using fallback:")
+        log_block(
+            "Stage 1",
+            "Query analysis fallback",
+            "Failed to parse JSON. Using fallback query plan.",
+        )
 
     return normalize_query_plan(parsed, question)
 
@@ -289,11 +332,18 @@ def retrieve_once(
             index["dense_retriever"].search(subquery, top_k=dense_top_k, label=label)
         )
 
-    print(f"Stage 2: Retrieval results (iteration {iteration}):")
-    print(
-        f"  BM25={len(bm25_results)} candidates | "
-        f"  Dense={sum(len(results) for results in dense_result_lists)} candidates "
-        f"  from {len(dense_result_lists)} subqueries \n"
+    log_block(
+        "Stage 2",
+        f"Retrieval results (iteration {iteration})",
+        "\n".join(
+            [
+                f"BM25 candidates: {len(bm25_results)}",
+                f"Dense candidates: {sum(len(results) for results in dense_result_lists)}",
+                f"Dense subqueries: {len(dense_result_lists)}",
+                f"BM25 chunk_ids: {format_result_chunk_ids(bm25_results)}",
+                f"Dense chunk_ids: {format_dense_result_chunk_ids(dense_result_lists)}",
+            ]
+        ),
     )
 
     return {
@@ -302,6 +352,29 @@ def retrieve_once(
         "bm25_results": bm25_results,
         "dense_result_lists": dense_result_lists,
     }
+
+
+def format_result_chunk_ids(results: list[dict[str, Any]]) -> str:
+    chunk_ids = dedupe_strings(
+        [result.get("chunk", {}).get("chunk_id", "") for result in results],
+        limit=50,
+    )
+    return ", ".join(chunk_ids) if chunk_ids else "(none)"
+
+
+def format_dense_result_chunk_ids(result_lists: list[list[dict[str, Any]]]) -> str:
+    if not result_lists:
+        return "(none)"
+
+    lines = []
+    for idx, results in enumerate(result_lists):
+        query = next((result.get("query") for result in results if result.get("query")), "")
+        chunk_ids = format_result_chunk_ids(results)
+        label = f"subquery {idx + 1}"
+        if query:
+            label = f"{label} ({query})"
+        lines.append(f"{label}: {chunk_ids}")
+    return "\n" + "\n".join(lines)
 
 
 def merge_accumulated_retrieval_results(
@@ -429,7 +502,11 @@ def retrieve_iterative(question: str, query_plan: dict, index) -> tuple[str, dic
         if evaluation["containing_answer"] == "yes":
             break
         if evaluation_iteration >= max_iterations:
-            print("Stage 3-1: Max iterative retrieval rounds reached. Proceeding with current context.")
+            log_block(
+                "Stage 3-1",
+                "Iteration stop",
+                "Max iterative retrieval rounds reached. Proceeding with current context.",
+            )
             break
 
         followup_query_plan = remove_existing_query_terms(
@@ -437,7 +514,11 @@ def retrieve_iterative(question: str, query_plan: dict, index) -> tuple[str, dic
             accumulated_query_plan,
         )
         if not has_retrieval_terms(followup_query_plan):
-            print("Stage 3-1: No follow-up retrieval terms generated. Proceeding with current context.")
+            log_block(
+                "Stage 3-1",
+                "Iteration stop",
+                "No new follow-up retrieval terms generated. Proceeding with current context.",
+            )
             break
 
         next_iteration = evaluation_iteration + 1
@@ -535,10 +616,17 @@ def normalize_context_evaluation(parsed: dict) -> dict[str, Any]:
 
 
 def log_context_evaluation(question: str, context: str, iteration: int, evaluation: dict[str, Any]) -> None:
-    print(f"Stage 3-1: Context sufficiency evaluation (iteration {iteration}):")
-    print(f"  Question: {question}")
-    print(f"  Retrieved context chars: {len(context)}")
-    print(json.dumps(evaluation, ensure_ascii=False, indent=2))
+    log_block(
+        "Stage 3-1",
+        f"Context sufficiency evaluation (iteration {iteration})",
+        "\n".join(
+            [
+                f"Question: {question}",
+                f"Retrieved context chars: {len(context)}",
+                json.dumps(evaluation, ensure_ascii=False, indent=2),
+            ]
+        ),
+    )
 
 
 def query_plan_from_context_evaluation(evaluation: dict[str, Any]) -> dict:
@@ -624,7 +712,7 @@ def generate_draft_answer(question: str, context: str, query_plan: dict) -> str:
     if not config["enabled"]:
         return ""
 
-    return call_solar_no_record(
+    draft = call_solar_no_record(
         system_prompt=DRAFT_GENERATION_PROMPT,
         messages=[
             {
@@ -640,6 +728,8 @@ def generate_draft_answer(question: str, context: str, query_plan: dict) -> str:
         temperature=config["temperature"],
         max_tokens=config["max_tokens"],
     )
+    log_block("Stage 3-2", "Draft answer", draft)
+    return draft
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -684,20 +774,20 @@ def finalize_answer(
 
 def run_pipeline(output_path: str = "submission.csv") -> None:
     # Phase 1: 인덱스 구축 (1회)
-    print("[1/3] 인덱스 구축 중...")
+    log_block("Pipeline", "Index build start", "Building parse artifacts, chunks, and retrieval indexes.")
     index = build_index(CORPUS_DIR)
 
     # 질문 로드
-    print("[2/3] 질문 로드 중...")
+    log_block("Pipeline", "Question load start", f"Test suite: {TEST_SUITE_PATH}")
     questions = load_test_suite(path=TEST_SUITE_PATH)
-    print(f"  → {len(questions)}개 질문\n")
+    log_block("Pipeline", "Question load completed", f"Questions: {len(questions)}")
 
     # Online stages: query analysis → retrieval → draft → final safety rewrite
-    print("[3/3] 파이프라인 실행 중...")
+    log_block("Pipeline", "Online stages start", "Running query analysis, retrieval, generation, and final safety rewrite.")
     tracker = UpstageTracker()
 
     for i, q in enumerate(questions):
-        print(f"Processing question {i+1}/{len(questions)}: {q['question']}")
+        log_block("Question", f"{i+1}/{len(questions)}", q["question"], leading_newlines=2)
         query_plan = analyze_query(q["question"])
         context, generation_query_plan = retrieve_iterative(q["question"], query_plan, index)
         draft_answer = generate_draft_answer(
@@ -715,15 +805,14 @@ def run_pipeline(output_path: str = "submission.csv") -> None:
             token=q["token"],
         )
         answer_one_line = answer.replace("\n", " ")
-        print(f"Question: {q['question']}")
-        print(f"Answer: {answer_one_line}")
-        print("-" * 80)
-        print()
+        log_block(
+            "Stage 4",
+            "Final answer",
+            f"Question: {q['question']}\nAnswer: {answer_one_line}",
+        )
 
     # 저장 + 검증
-    print()
     tracker.save_csv(output_path)
-    print()
     validate(output_path)
 
 

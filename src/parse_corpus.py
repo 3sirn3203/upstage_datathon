@@ -1,8 +1,11 @@
 """
 parse_corpus.py — Convert PDF corpus files into reusable text artifacts.
 
-The parser backend is controlled by config.yaml:
-    parsing.backend: pdfplumber | upstage_api
+The parser backend is selected by the caller:
+    option="pdfplumber" | "upstage_api"
+
+baseline_rag.py runs both parsers: Upstage API for primary RAG parsing and
+pdfplumber for side-channel inspection/anomaly detection.
 
 Outputs:
     parsed_corpus/<backend>/pages.jsonl
@@ -28,6 +31,11 @@ from typing import Any, Iterable
 
 import pdfplumber
 import yaml
+
+try:
+    from .logging_utils import log_block
+except ImportError:
+    from logging_utils import log_block
 
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
@@ -116,7 +124,7 @@ def parse_pdf_with_pdfplumber(path: Path, *, extract_tables: bool = True) -> Ite
 def call_upstage_document_parse(path: Path, config: dict[str, Any]) -> dict[str, Any]:
     api_key = os.environ.get("UPSTAGE_API_KEY")
     if not api_key:
-        raise EnvironmentError("UPSTAGE_API_KEY is required for parsing.backend=upstage_api")
+        raise EnvironmentError("UPSTAGE_API_KEY is required for option=upstage_api")
 
     import requests
 
@@ -277,7 +285,11 @@ def parse_corpus(
     should_force = parsing_config.get("force", False) if force is None else force
 
     if jsonl_path.exists() and not should_force:
-        print(f"[parse_corpus] using cached parse: {jsonl_path}")
+        log_block(
+            f"Parse:{backend}",
+            "Cache hit",
+            f"Using cached parse: {jsonl_path}",
+        )
         return jsonl_path
 
     pdf_paths = sorted(corpus_path.glob("*.pdf"))
@@ -296,6 +308,7 @@ def parse_corpus(
     if tmp_jsonl_path.exists():
         tmp_jsonl_path.unlink()
 
+    parsed_summaries = []
     try:
         with tmp_jsonl_path.open("w", encoding="utf-8") as jsonl_file:
             for pdf_path in pdf_paths:
@@ -321,15 +334,25 @@ def parse_corpus(
                     jsonl_file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
                 write_text_dump(records, text_dir / f"{pdf_path.stem}.txt")
-                print(f"[parsed:{backend}] {pdf_path.name}: {len(records)} pages")
+                parsed_summaries.append(f"- {pdf_path.name}: {len(records)} pages")
     except Exception:
         if tmp_jsonl_path.exists():
             tmp_jsonl_path.unlink()
         raise
 
     tmp_jsonl_path.replace(jsonl_path)
-    print(f"[done] wrote {total_pages} pages to {jsonl_path}")
-    print(f"[done] wrote text dumps to {text_dir}")
+    log_block(
+        f"Parse:{backend}",
+        "Completed",
+        "\n".join(
+            [
+                *parsed_summaries,
+                f"Total pages: {total_pages}",
+                f"Pages JSONL: {jsonl_path}",
+                f"Text dumps: {text_dir}",
+            ]
+        ),
+    )
     return jsonl_path
 
 

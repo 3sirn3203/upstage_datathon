@@ -26,7 +26,8 @@ export HACKATHON_KEY=<hackathon_key>   # 대회 당일 실제 test suite 복호�
 
 ```yaml
 parsing:
-  backend: upstage_api   # upstage_api 또는 pdfplumber
+  output_dir: parsed_corpus
+  force: false
 
 chunking:
   max_chunk_chars: 1200
