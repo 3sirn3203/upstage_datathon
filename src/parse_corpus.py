@@ -1,31 +1,21 @@
 """
 parse_corpus.py — Convert PDF corpus files into reusable text artifacts.
 
-The parser backend is selected by the caller:
-    option="pdfplumber" | "upstage_api"
-
-baseline_rag.py runs both parsers: Upstage API for primary RAG parsing and
-pdfplumber for side-channel inspection/anomaly detection.
+The parser uses pdfplumber only.
 
 Outputs:
-    parsed_corpus/<backend>/pages.jsonl
+    parsed_corpus/pdfplumber/pages.jsonl
         One JSON object per parsed page.
 
-    parsed_corpus/<backend>/text/<pdf_stem>.txt
+    parsed_corpus/pdfplumber/text/<pdf_stem>.txt
         Human-readable text dump for quick inspection.
-
-    parsed_corpus/upstage_api/raw/<pdf_stem>.json
-        Raw Upstage API responses, when using the upstage_api backend.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
-from time import sleep
-import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -42,7 +32,7 @@ except ImportError:
 DEFAULT_CONFIG_PATH = Path("config.yaml")
 DEFAULT_CORPUS_DIR = Path("distribution/corpus")
 DEFAULT_OUTPUT_DIR = Path("parsed_corpus")
-SUPPORTED_BACKENDS = {"pdfplumber", "upstage_api"}
+SUPPORTED_BACKENDS = {"pdfplumber"}
 CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
@@ -122,281 +112,6 @@ def parse_pdf_with_pdfplumber(path: Path, *, extract_tables: bool = True) -> Ite
             }
 
 
-def call_upstage_document_parse(path: Path, config: dict[str, Any]) -> dict[str, Any]:
-    api_key = os.environ.get("UPSTAGE_API_KEY")
-    if not api_key:
-        raise EnvironmentError("UPSTAGE_API_KEY is required for option=upstage_api")
-
-    import requests
-
-    data = {
-        "model": config.get("model", "document-parse"),
-        "ocr": config.get("ocr", "auto"),
-        "output_formats": str(config.get("output_formats", ["markdown"])),
-    }
-    if config.get("base64_encoding") is not None:
-        data["base64_encoding"] = str(config["base64_encoding"])
-    if config.get("mode"):
-        data["mode"] = config["mode"]
-    if config.get("coordinates") is not None:
-        data["coordinates"] = str(bool(config["coordinates"])).lower()
-
-    with path.open("rb") as file:
-        response = requests.post(
-            config.get("url", "https://api.upstage.ai/v1/document-digitization"),
-            headers={"Authorization": f"Bearer {api_key}"},
-            files={"document": file},
-            data=data,
-            timeout=int(config.get("timeout_seconds", 300)),
-        )
-
-    response.raise_for_status()
-    return response.json()
-
-
-def count_pdf_pages(path: Path) -> int:
-    with pdfplumber.open(path) as pdf:
-        return len(pdf.pages)
-
-
-def upstage_max_pages_per_request(config: dict[str, Any]) -> int:
-    return max(1, int(config.get("max_pages_per_request", 90)))
-
-
-def should_split_for_upstage(path: Path, config: dict[str, Any]) -> tuple[bool, int, int]:
-    page_count = count_pdf_pages(path)
-    max_pages = upstage_max_pages_per_request(config)
-    split_enabled = bool(config.get("split_large_pdfs", True))
-    return split_enabled and page_count > max_pages, page_count, max_pages
-
-
-def split_pdf_page_ranges(page_count: int, max_pages: int) -> list[tuple[int, int]]:
-    ranges = []
-    for start_page in range(1, page_count + 1, max_pages):
-        end_page = min(start_page + max_pages - 1, page_count)
-        ranges.append((start_page, end_page))
-    return ranges
-
-
-def write_pdf_page_range(source_path: Path, output_path: Path, start_page: int, end_page: int) -> None:
-    try:
-        from pypdf import PdfReader, PdfWriter
-    except ImportError as exc:
-        raise ImportError(
-            "pypdf is required to split PDFs before Upstage parsing. "
-            "Install dependencies with `pip install -r requirements.txt`."
-        ) from exc
-
-    reader = PdfReader(str(source_path))
-    writer = PdfWriter()
-    for page_index in range(start_page - 1, end_page):
-        writer.add_page(reader.pages[page_index])
-
-    if reader.metadata:
-        writer.add_metadata({str(key): str(value) for key, value in reader.metadata.items()})
-
-    with output_path.open("wb") as file:
-        writer.write(file)
-
-
-def offset_response_pages(response: dict[str, Any], page_offset: int) -> dict[str, Any]:
-    adjusted = json.loads(json.dumps(response))
-
-    elements = adjusted.get("elements")
-    if isinstance(elements, list):
-        for item in elements:
-            if isinstance(item, dict):
-                offset_page_fields(item, page_offset)
-
-    pages = adjusted.get("pages")
-    if isinstance(pages, list):
-        for item in pages:
-            if isinstance(item, dict):
-                offset_page_fields(item, page_offset)
-    elif adjusted.get("content") or adjusted.get("markdown") or adjusted.get("html") or adjusted.get("text"):
-        adjusted["pages"] = [
-            {
-                "page": 1 + page_offset,
-                "content": adjusted.get("content"),
-                "markdown": adjusted.get("markdown"),
-                "html": adjusted.get("html"),
-                "text": adjusted.get("text"),
-            }
-        ]
-
-    return adjusted
-
-
-def offset_page_fields(item: dict[str, Any], page_offset: int) -> None:
-    for field in ("page", "page_number", "page_idx"):
-        if item.get(field) is not None:
-            item[field] = int(item[field]) + page_offset
-            return
-    item["page"] = 1 + page_offset
-
-
-def merge_upstage_responses(responses: list[dict[str, Any]]) -> dict[str, Any]:
-    if not responses:
-        return {}
-
-    merged = {
-        "api": responses[0].get("api"),
-        "model": responses[0].get("model"),
-        "split_merge": True,
-        "elements": [],
-        "pages": [],
-    }
-    for response in responses:
-        elements = response.get("elements")
-        if isinstance(elements, list):
-            merged["elements"].extend(elements)
-        pages = response.get("pages")
-        if isinstance(pages, list):
-            merged["pages"].extend(pages)
-
-    if not merged["elements"]:
-        merged.pop("elements")
-    if not merged["pages"]:
-        merged.pop("pages")
-    return merged
-
-
-def call_upstage_document_parse_with_splitting(
-    path: Path,
-    config: dict[str, Any],
-    raw_dir: Path,
-) -> tuple[dict[str, Any], str]:
-    should_split, page_count, max_pages = should_split_for_upstage(path, config)
-    if not should_split:
-        return call_upstage_document_parse(path, config), f"{page_count} pages"
-
-    ranges = split_pdf_page_ranges(page_count, max_pages)
-    adjusted_responses = []
-    shard_raw_dir = raw_dir / "shards" / path.stem
-    shard_raw_dir.mkdir(parents=True, exist_ok=True)
-
-    with tempfile.TemporaryDirectory(prefix=f"{path.stem}_", dir=str(raw_dir.parent)) as tmp_dir_name:
-        tmp_dir = Path(tmp_dir_name)
-        for start_page, end_page in ranges:
-            shard_name = f"{path.stem}__p{start_page:03d}-p{end_page:03d}.pdf"
-            shard_path = tmp_dir / shard_name
-            write_pdf_page_range(path, shard_path, start_page, end_page)
-            shard_response = call_upstage_document_parse(shard_path, config)
-            (shard_raw_dir / f"{Path(shard_name).stem}.json").write_text(
-                json.dumps(shard_response, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            adjusted_responses.append(offset_response_pages(shard_response, start_page - 1))
-            sleep(2)
-
-    merged_response = merge_upstage_responses(adjusted_responses)
-    merged_response["source_file"] = path.name
-    merged_response["total_pages"] = page_count
-    merged_response["split_ranges"] = [
-        {"start_page": start_page, "end_page": end_page}
-        for start_page, end_page in ranges
-    ]
-    summary = f"{page_count} pages split into {len(ranges)} requests (max {max_pages} pages/request)"
-    return merged_response, summary
-
-
-def _extract_content(value: Any) -> str:
-    if isinstance(value, str):
-        return clean_text(value)
-    if isinstance(value, dict):
-        for key in ("markdown", "html", "text"):
-            if key in value:
-                text = _extract_content(value[key])
-                if text:
-                    return text
-    return ""
-
-
-def _extract_upstage_element(item: dict[str, Any]) -> dict[str, Any] | None:
-    text = (
-        _extract_content(item.get("content"))
-        or _extract_content(item.get("markdown"))
-        or _extract_content(item.get("html"))
-        or _extract_content(item.get("text"))
-    )
-    if not text:
-        return None
-
-    element = {
-        "id": item.get("id"),
-        "category": item.get("category", ""),
-        "text": text,
-    }
-    if item.get("coordinates") is not None:
-        element["coordinates"] = item["coordinates"]
-    return element
-
-
-def upstage_response_to_pages(source: str, response: dict[str, Any]) -> list[dict[str, Any]]:
-    pages: dict[int, list[str]] = defaultdict(list)
-    page_elements: dict[int, list[dict[str, Any]]] = defaultdict(list)
-
-    elements = response.get("elements")
-    if isinstance(elements, list):
-        for item in elements:
-            if not isinstance(item, dict):
-                continue
-            page = int(item.get("page") or item.get("page_number") or item.get("page_idx") or 1)
-            element = _extract_upstage_element(item)
-            if element:
-                pages[page].append(element["text"])
-                page_elements[page].append(element)
-
-    page_items = response.get("pages")
-    if isinstance(page_items, list):
-        for item in page_items:
-            if not isinstance(item, dict):
-                continue
-            page = int(item.get("page") or item.get("page_number") or item.get("page_idx") or 1)
-            if page in pages:
-                continue
-            text = (
-                _extract_content(item.get("content"))
-                or _extract_content(item.get("markdown"))
-                or _extract_content(item.get("html"))
-                or _extract_content(item.get("text"))
-            )
-            if text:
-                pages[page].append(text)
-
-    if not pages:
-        text = (
-            _extract_content(response.get("content"))
-            or _extract_content(response.get("markdown"))
-            or _extract_content(response.get("html"))
-            or _extract_content(response.get("text"))
-        )
-        if text:
-            pages[1].append(text)
-
-    return [
-        {
-            "source": source,
-            "page": page,
-            "backend": "upstage_api",
-            "text": "\n\n".join(parts),
-            "tables": [
-                {
-                    "table_index": table_index,
-                    "text": element["text"],
-                    "element_id": element.get("id"),
-                }
-                for table_index, element in enumerate(
-                    [element for element in page_elements.get(page, []) if element.get("category") == "table"],
-                    start=1,
-                )
-            ],
-            "elements": page_elements.get(page, []),
-        }
-        for page, parts in sorted(pages.items())
-    ]
-
-
 def write_text_dump(records: list[dict[str, Any]], output_path: Path) -> None:
     parts = []
     for record in records:
@@ -408,6 +123,67 @@ def write_text_dump(records: list[dict[str, Any]], output_path: Path) -> None:
         parts.append("")
 
     output_path.write_text("\n".join(parts), encoding="utf-8")
+
+
+def write_page_records(records: list[dict[str, Any]], output_path: Path) -> None:
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as file:
+        for record in records:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    tmp_path.replace(output_path)
+
+
+def load_page_records(path: Path) -> list[dict[str, Any]]:
+    records = []
+    with path.open(encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
+def parse_single_pdf(
+    pdf_path: Path,
+    *,
+    parsing_config: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str]:
+    backend_config = parsing_config.get("pdfplumber", {})
+    records = list(
+        parse_pdf_with_pdfplumber(
+            pdf_path,
+            extract_tables=backend_config.get("extract_tables", True),
+        )
+    )
+    return records, f"{len(records)} pages"
+
+
+def seed_page_cache_from_combined_jsonl(jsonl_path: Path, page_cache_dir: Path) -> int:
+    if not jsonl_path.exists() or any(page_cache_dir.glob("*.jsonl")):
+        return 0
+
+    records_by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in load_page_records(jsonl_path):
+        source = str(record.get("source") or "")
+        if source:
+            records_by_source[source].append(record)
+
+    for source, records in records_by_source.items():
+        write_page_records(records, page_cache_dir / f"{Path(source).stem}.jsonl")
+    return len(records_by_source)
+
+
+def combined_cache_covers_corpus(jsonl_path: Path, pdf_paths: list[Path]) -> bool:
+    if not jsonl_path.exists():
+        return False
+
+    expected_sources = {pdf_path.name for pdf_path in pdf_paths}
+    cached_sources = {
+        str(record.get("source") or "")
+        for record in load_page_records(jsonl_path)
+        if record.get("source")
+    }
+    return expected_sources <= cached_sources
 
 
 def parse_corpus(
@@ -431,7 +207,11 @@ def parse_corpus(
     jsonl_path = backend_output_dir / "pages.jsonl"
     should_force = parsing_config.get("force", False) if force is None else force
 
-    if jsonl_path.exists() and not should_force:
+    pdf_paths = sorted(corpus_path.glob("*.pdf"))
+    if not pdf_paths:
+        raise FileNotFoundError(f"No PDF files found in {corpus_path}")
+
+    if jsonl_path.exists() and not should_force and combined_cache_covers_corpus(jsonl_path, pdf_paths):
         log_block(
             f"Parse:{backend}",
             "Cache hit",
@@ -439,56 +219,54 @@ def parse_corpus(
         )
         return jsonl_path
 
-    pdf_paths = sorted(corpus_path.glob("*.pdf"))
-    if not pdf_paths:
-        raise FileNotFoundError(f"No PDF files found in {corpus_path}")
+    if jsonl_path.exists() and not should_force:
+        log_block(
+            f"Parse:{backend}",
+            "Cache incomplete",
+            f"Existing combined cache does not cover current corpus. Resuming with per-document cache: {jsonl_path}",
+        )
 
     text_dir = backend_output_dir / "text"
     text_dir.mkdir(parents=True, exist_ok=True)
+    page_cache_dir = backend_output_dir / "pages"
+    page_cache_dir.mkdir(parents=True, exist_ok=True)
+    seeded_cache_count = seed_page_cache_from_combined_jsonl(jsonl_path, page_cache_dir) if not should_force else 0
     total_pages = 0
-
-    raw_dir = backend_output_dir / "raw"
-    if backend == "upstage_api":
-        raw_dir.mkdir(parents=True, exist_ok=True)
 
     tmp_jsonl_path = jsonl_path.with_suffix(".jsonl.tmp")
     if tmp_jsonl_path.exists():
         tmp_jsonl_path.unlink()
 
     parsed_summaries = []
+    if seeded_cache_count:
+        parsed_summaries.append(f"- seeded per-document cache from existing pages.jsonl: {seeded_cache_count} files")
     try:
+        for index, pdf_path in enumerate(pdf_paths, start=1):
+            page_cache_path = page_cache_dir / f"{pdf_path.stem}.jsonl"
+            if page_cache_path.exists() and not should_force:
+                records = load_page_records(page_cache_path)
+                parse_summary = "resumed from per-document cache"
+            else:
+                records, parse_summary = parse_single_pdf(
+                    pdf_path,
+                    parsing_config=parsing_config,
+                )
+                write_page_records(records, page_cache_path)
+                write_text_dump(records, text_dir / f"{pdf_path.stem}.txt")
+
+            total_pages += len(records)
+            parsed_summaries.append(f"- {pdf_path.name}: {len(records)} pages ({parse_summary})")
+            print(
+                f"[parse:{backend}] {index}/{len(pdf_paths)} {pdf_path.name}: "
+                f"{len(records)} pages ({parse_summary})",
+                flush=True,
+            )
+
         with tmp_jsonl_path.open("w", encoding="utf-8") as jsonl_file:
             for pdf_path in pdf_paths:
-                if backend == "pdfplumber":
-                    backend_config = parsing_config.get("pdfplumber", {})
-                    records = list(
-                        parse_pdf_with_pdfplumber(
-                            pdf_path,
-                            extract_tables=backend_config.get("extract_tables", True),
-                        )
-                    )
-                else:
-                    response, parse_summary = call_upstage_document_parse_with_splitting(
-                        pdf_path,
-                        parsing_config.get("upstage_api", {}),
-                        raw_dir,
-                    )
-                    (raw_dir / f"{pdf_path.stem}.json").write_text(
-                        json.dumps(response, ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
-                    records = upstage_response_to_pages(pdf_path.name, response)
-                    sleep(2)
-
-                total_pages += len(records)
-                for record in records:
+                page_cache_path = page_cache_dir / f"{pdf_path.stem}.jsonl"
+                for record in load_page_records(page_cache_path):
                     jsonl_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-                write_text_dump(records, text_dir / f"{pdf_path.stem}.txt")
-                if backend == "upstage_api":
-                    parsed_summaries.append(f"- {pdf_path.name}: {len(records)} pages ({parse_summary})")
-                else:
-                    parsed_summaries.append(f"- {pdf_path.name}: {len(records)} pages")
     except Exception:
         if tmp_jsonl_path.exists():
             tmp_jsonl_path.unlink()

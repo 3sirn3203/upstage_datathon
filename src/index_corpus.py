@@ -80,7 +80,7 @@ def config_from_dict(config: dict[str, Any]) -> DenseIndexConfig:
 def default_chunks_path(config: dict[str, Any]) -> Path:
     parsing = config.get("parsing", {})
     chunking = config.get("chunking", {})
-    backend = parsing.get("backend", "upstage_api")
+    backend = parsing.get("backend", "pdfplumber")
     output_dir = Path(parsing.get("output_dir", "parsed_corpus"))
     chunk_filename = chunking.get("output_filename", "chunks.jsonl")
     return output_dir / backend / chunk_filename

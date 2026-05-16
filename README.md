@@ -26,12 +26,15 @@ export HACKATHON_KEY=<hackathon_key>   # 대회 당일 실제 test suite 복호�
 
 ```yaml
 parsing:
+  backend: pdfplumber
   output_dir: parsed_corpus
   force: false
+  pdfplumber:
+    extract_tables: true
 
 chunking:
   max_chunk_chars: 1200
-  overlap_chars: 200
+  overlap_chars: 400
 
 indexing:
   bm25:
@@ -77,7 +80,6 @@ PDF corpus
 파싱만 실행:
 
 ```bash
-.venv/bin/python src/parse_corpus.py --option upstage_api
 .venv/bin/python src/parse_corpus.py --option pdfplumber
 ```
 
@@ -85,22 +87,22 @@ PDF corpus
 
 ```bash
 .venv/bin/python src/chunk_corpus.py \
-  --pages parsed_corpus/upstage_api/pages.jsonl \
-  --output parsed_corpus/upstage_api/chunks.jsonl
+  --pages parsed_corpus/pdfplumber/pages.jsonl \
+  --output parsed_corpus/pdfplumber/chunks.jsonl
 ```
 
 FAISS dense index 생성:
 
 ```bash
 .venv/bin/python src/index_corpus.py \
-  --chunks parsed_corpus/upstage_api/chunks.jsonl
+  --chunks parsed_corpus/pdfplumber/chunks.jsonl
 ```
 
 BM25 검색 확인:
 
 ```bash
 .venv/bin/python src/retriever_bm25.py \
-  parsed_corpus/upstage_api/chunks.jsonl \
+  parsed_corpus/pdfplumber/chunks.jsonl \
   김민준 전략기획팀 인건비 비율 \
   --top-k 8
 ```
@@ -115,21 +117,16 @@ Dense 검색 확인:
 
 ## Artifacts
 
-파서 backend별로 산출물이 분리됩니다.
+파싱 산출물은 pdfplumber backend 아래에 생성됩니다.
 
 ```text
 parsed_corpus/
-  upstage_api/
+  pdfplumber/
     pages.jsonl
     chunks.jsonl
     dense.faiss
     dense_metadata.jsonl
     dense_embeddings.npy
-    raw/*.json
-    text/*.txt
-  pdfplumber/
-    pages.jsonl
-    chunks.jsonl
     text/*.txt
 ```
 
@@ -152,8 +149,8 @@ upstage_tracker.py           # final Solar call + submission.csv tracking
 validator.py                 # submission.csv schema validation
 
 src/
-  parse_corpus.py            # pdfplumber / Upstage Document Parse
-  chunk_corpus.py            # Markdown section + table chunking
+  parse_corpus.py            # pdfplumber PDF parser
+  chunk_corpus.py            # fixed-size page chunking
   index_corpus.py            # Upstage embedding + FAISS index build
   retriever_bm25.py          # in-memory BM25 retriever
   retriever_dense.py         # query embedding + FAISS dense retriever

@@ -107,7 +107,7 @@ def load_metadata(path: Path) -> list[dict[str, Any]]:
 def default_dense_paths(config: dict[str, Any]) -> tuple[Path, Path]:
     parsing = config.get("parsing", {})
     dense = config.get("indexing", {}).get("dense", {})
-    backend = parsing.get("backend", "upstage_api")
+    backend = parsing.get("backend", "pdfplumber")
     output_dir = Path(parsing.get("output_dir", "parsed_corpus")) / backend
     return (
         output_dir / dense.get("faiss_filename", "dense.faiss"),

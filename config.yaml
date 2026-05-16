@@ -2,27 +2,16 @@ corpus:
   dir: distribution/corpus
 
 parsing:
+  backend: pdfplumber
   output_dir: parsed_corpus
   force: false
 
   pdfplumber:
     extract_tables: true
 
-  upstage_api:
-    url: https://api.upstage.ai/v1/document-digitization
-    model: document-parse
-    ocr: auto
-    output_formats:
-      - markdown
-    timeout_seconds: 300
-    split_large_pdfs: true
-    max_pages_per_request: 90
-
 chunking:
   max_chunk_chars: 1200
-  overlap_chars: 200
-  min_chunk_chars: 80
-  include_table_chunks: true
+  overlap_chars: 400
   output_filename: chunks.jsonl
 
 indexing:

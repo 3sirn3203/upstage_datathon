@@ -122,21 +122,12 @@ def build_index(corpus_dir: str):
     parsing_config = CONFIG.get("parsing", {})
     parsed_path = parse_corpus(
         corpus_dir=corpus_dir,
-        option="upstage_api",
-        output_dir=parsing_config.get("output_dir", "parsed_corpus"),
-        config_path=DEFAULT_CONFIG_PATH,
-        force=parsing_config.get("force", False),
-    )
-    log_block("Index Build", "Primary parse selected", f"Upstage pages: {parsed_path}")
-
-    pdfplumber_parsed_path = parse_corpus(
-        corpus_dir=corpus_dir,
         option="pdfplumber",
         output_dir=parsing_config.get("output_dir", "parsed_corpus"),
         config_path=DEFAULT_CONFIG_PATH,
         force=parsing_config.get("force", False),
     )
-    log_block("Index Build", "Side parse completed", f"pdfplumber pages: {pdfplumber_parsed_path}")
+    log_block("Index Build", "Parse selected", f"pdfplumber pages: {parsed_path}")
 
     suspicion_map = build_suspicion_map(corpus_dir)
     log_poisoning_suspicion_map(suspicion_map)
@@ -167,7 +158,6 @@ def build_index(corpus_dir: str):
 
     return {
         "parsed_path": parsed_path,
-        "pdfplumber_parsed_path": pdfplumber_parsed_path,
         "suspicion_map": suspicion_map,
         "chunks_path": chunks_path,
         "chunks": chunks,
