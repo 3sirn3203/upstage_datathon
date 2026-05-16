@@ -25,6 +25,7 @@ import json
 import os
 import re
 from time import sleep
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -151,6 +152,152 @@ def call_upstage_document_parse(path: Path, config: dict[str, Any]) -> dict[str,
 
     response.raise_for_status()
     return response.json()
+
+
+def count_pdf_pages(path: Path) -> int:
+    with pdfplumber.open(path) as pdf:
+        return len(pdf.pages)
+
+
+def upstage_max_pages_per_request(config: dict[str, Any]) -> int:
+    return max(1, int(config.get("max_pages_per_request", 90)))
+
+
+def should_split_for_upstage(path: Path, config: dict[str, Any]) -> tuple[bool, int, int]:
+    page_count = count_pdf_pages(path)
+    max_pages = upstage_max_pages_per_request(config)
+    split_enabled = bool(config.get("split_large_pdfs", True))
+    return split_enabled and page_count > max_pages, page_count, max_pages
+
+
+def split_pdf_page_ranges(page_count: int, max_pages: int) -> list[tuple[int, int]]:
+    ranges = []
+    for start_page in range(1, page_count + 1, max_pages):
+        end_page = min(start_page + max_pages - 1, page_count)
+        ranges.append((start_page, end_page))
+    return ranges
+
+
+def write_pdf_page_range(source_path: Path, output_path: Path, start_page: int, end_page: int) -> None:
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except ImportError as exc:
+        raise ImportError(
+            "pypdf is required to split PDFs before Upstage parsing. "
+            "Install dependencies with `pip install -r requirements.txt`."
+        ) from exc
+
+    reader = PdfReader(str(source_path))
+    writer = PdfWriter()
+    for page_index in range(start_page - 1, end_page):
+        writer.add_page(reader.pages[page_index])
+
+    if reader.metadata:
+        writer.add_metadata({str(key): str(value) for key, value in reader.metadata.items()})
+
+    with output_path.open("wb") as file:
+        writer.write(file)
+
+
+def offset_response_pages(response: dict[str, Any], page_offset: int) -> dict[str, Any]:
+    adjusted = json.loads(json.dumps(response))
+
+    elements = adjusted.get("elements")
+    if isinstance(elements, list):
+        for item in elements:
+            if isinstance(item, dict):
+                offset_page_fields(item, page_offset)
+
+    pages = adjusted.get("pages")
+    if isinstance(pages, list):
+        for item in pages:
+            if isinstance(item, dict):
+                offset_page_fields(item, page_offset)
+    elif adjusted.get("content") or adjusted.get("markdown") or adjusted.get("html") or adjusted.get("text"):
+        adjusted["pages"] = [
+            {
+                "page": 1 + page_offset,
+                "content": adjusted.get("content"),
+                "markdown": adjusted.get("markdown"),
+                "html": adjusted.get("html"),
+                "text": adjusted.get("text"),
+            }
+        ]
+
+    return adjusted
+
+
+def offset_page_fields(item: dict[str, Any], page_offset: int) -> None:
+    for field in ("page", "page_number", "page_idx"):
+        if item.get(field) is not None:
+            item[field] = int(item[field]) + page_offset
+            return
+    item["page"] = 1 + page_offset
+
+
+def merge_upstage_responses(responses: list[dict[str, Any]]) -> dict[str, Any]:
+    if not responses:
+        return {}
+
+    merged = {
+        "api": responses[0].get("api"),
+        "model": responses[0].get("model"),
+        "split_merge": True,
+        "elements": [],
+        "pages": [],
+    }
+    for response in responses:
+        elements = response.get("elements")
+        if isinstance(elements, list):
+            merged["elements"].extend(elements)
+        pages = response.get("pages")
+        if isinstance(pages, list):
+            merged["pages"].extend(pages)
+
+    if not merged["elements"]:
+        merged.pop("elements")
+    if not merged["pages"]:
+        merged.pop("pages")
+    return merged
+
+
+def call_upstage_document_parse_with_splitting(
+    path: Path,
+    config: dict[str, Any],
+    raw_dir: Path,
+) -> tuple[dict[str, Any], str]:
+    should_split, page_count, max_pages = should_split_for_upstage(path, config)
+    if not should_split:
+        return call_upstage_document_parse(path, config), f"{page_count} pages"
+
+    ranges = split_pdf_page_ranges(page_count, max_pages)
+    adjusted_responses = []
+    shard_raw_dir = raw_dir / "shards" / path.stem
+    shard_raw_dir.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix=f"{path.stem}_", dir=str(raw_dir.parent)) as tmp_dir_name:
+        tmp_dir = Path(tmp_dir_name)
+        for start_page, end_page in ranges:
+            shard_name = f"{path.stem}__p{start_page:03d}-p{end_page:03d}.pdf"
+            shard_path = tmp_dir / shard_name
+            write_pdf_page_range(path, shard_path, start_page, end_page)
+            shard_response = call_upstage_document_parse(shard_path, config)
+            (shard_raw_dir / f"{Path(shard_name).stem}.json").write_text(
+                json.dumps(shard_response, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            adjusted_responses.append(offset_response_pages(shard_response, start_page - 1))
+            sleep(2)
+
+    merged_response = merge_upstage_responses(adjusted_responses)
+    merged_response["source_file"] = path.name
+    merged_response["total_pages"] = page_count
+    merged_response["split_ranges"] = [
+        {"start_page": start_page, "end_page": end_page}
+        for start_page, end_page in ranges
+    ]
+    summary = f"{page_count} pages split into {len(ranges)} requests (max {max_pages} pages/request)"
+    return merged_response, summary
 
 
 def _extract_content(value: Any) -> str:
@@ -321,7 +468,11 @@ def parse_corpus(
                         )
                     )
                 else:
-                    response = call_upstage_document_parse(pdf_path, parsing_config.get("upstage_api", {}))
+                    response, parse_summary = call_upstage_document_parse_with_splitting(
+                        pdf_path,
+                        parsing_config.get("upstage_api", {}),
+                        raw_dir,
+                    )
                     (raw_dir / f"{pdf_path.stem}.json").write_text(
                         json.dumps(response, ensure_ascii=False, indent=2),
                         encoding="utf-8",
@@ -334,7 +485,10 @@ def parse_corpus(
                     jsonl_file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
                 write_text_dump(records, text_dir / f"{pdf_path.stem}.txt")
-                parsed_summaries.append(f"- {pdf_path.name}: {len(records)} pages")
+                if backend == "upstage_api":
+                    parsed_summaries.append(f"- {pdf_path.name}: {len(records)} pages ({parse_summary})")
+                else:
+                    parsed_summaries.append(f"- {pdf_path.name}: {len(records)} pages")
     except Exception:
         if tmp_jsonl_path.exists():
             tmp_jsonl_path.unlink()

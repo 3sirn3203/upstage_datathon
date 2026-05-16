@@ -700,7 +700,7 @@ def config_from_dict(config: dict[str, Any]) -> ChunkingConfig:
 
 def default_pages_path(config: dict[str, Any]) -> Path:
     parsing = config.get("parsing", {})
-    backend = parsing.get("backend", "pdfplumber")
+    backend = parsing.get("backend", "upstage_api")
     output_dir = Path(parsing.get("output_dir", "parsed_corpus"))
     return output_dir / backend / "pages.jsonl"
 
