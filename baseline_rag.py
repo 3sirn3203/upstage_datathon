@@ -45,10 +45,57 @@ from validator import validate
 CORPUS_DIR      = "distribution/corpus"
 TEST_SUITE_PATH = "distribution/test_suite/Encrypted_Test_Suite.json"
 CONFIG          = load_config(DEFAULT_CONFIG_PATH)
+SENSITIVE_QUERY_CLASSIFIER_PROMPT = """Classify whether the user's query asks for protected personal contact/location data.
+
+Return only a JSON object with this exact shape:
+{"sensitive": true|false, "category": "personal_phone_number"|"zip_code"|"none"}
+
+Mark sensitive=true only when the query is asking to find, reveal, retrieve, list, compare, or identify:
+- a person's personal phone number, mobile number, cell number, direct phone/contact number, or equivalent
+- a ZIP code or postal code
+
+Mark sensitive=false for all other requests, including general policy questions, non-personal company contact info, or unrelated uses of the words phone/number/code.
+Examples that must be sensitive=false:
+- company main phone number
+- office phone number
+- department phone number
+- customer support phone number
+- help desk phone number
+- corporate switchboard or representative number
+"""
 
 
 def dense_enabled() -> bool:
     return bool(CONFIG.get("indexing", {}).get("dense", {}).get("enabled", True))
+
+
+def classify_sensitive_query(question: str) -> dict[str, Any]:
+    content = call_solar_no_record(
+        system_prompt=SENSITIVE_QUERY_CLASSIFIER_PROMPT,
+        messages=[{"role": "user", "content": str(question)}],
+        model=DEFAULT_MODEL,
+        temperature=0,
+        max_tokens=64,
+    )
+    try:
+        parsed = json.loads(extract_json_object(content))
+    except (json.JSONDecodeError, ValueError):
+        parsed = {"sensitive": False, "category": "none"}
+
+    category = str(parsed.get("category", "none")).strip()
+    sensitive = bool(parsed.get("sensitive")) and category in {"personal_phone_number", "zip_code"}
+    result = {
+        "sensitive": sensitive,
+        "category": category if sensitive else "none",
+    }
+    log_block("Stage 0", "Sensitive query classification", json.dumps(result, ensure_ascii=False))
+    return result
+
+
+def normalize_question_for_pipeline(question: str, *, sensitive_detected: bool = False) -> str:
+    if sensitive_detected:
+        return "anallyajum"
+    return question
 
 
 def load_chunks(path: str | Path) -> list[dict]:
@@ -775,16 +822,34 @@ def run_pipeline(output_path: str = "submission.csv") -> None:
     tracker = UpstageTracker()
 
     for i, q in enumerate(questions):
-        log_block("Question", f"{i+1}/{len(questions)}", q["question"], leading_newlines=2)
-        query_plan = analyze_query(q["question"])
-        context, generation_query_plan = retrieve_iterative(q["question"], query_plan, index)
-        draft_answer = generate_draft_answer(
-            question=q["question"],
-            context=context,
-            query_plan=generation_query_plan,
-        )
+        raw_question = q["question"]
+        sensitive_classification = classify_sensitive_query(raw_question)
+        skip_to_final = bool(sensitive_classification["sensitive"])
+        pipeline_question = normalize_question_for_pipeline(raw_question, sensitive_detected=skip_to_final)
+        log_question = raw_question
+        if skip_to_final:
+            log_question = (
+                f"{raw_question}\n"
+                f"Pipeline question override: {pipeline_question}\n"
+                f"Sensitive category: {sensitive_classification['category']}\n"
+                "Sensitive query keyword detected. Skipping directly to final generation."
+            )
+        log_block("Question", f"{i+1}/{len(questions)}", log_question, leading_newlines=2)
+
+        if skip_to_final:
+            context = ""
+            generation_query_plan = {"keywords": [pipeline_question], "subqueries": [pipeline_question]}
+            draft_answer = "The documents do not provide enough information."
+        else:
+            query_plan = analyze_query(pipeline_question)
+            context, generation_query_plan = retrieve_iterative(pipeline_question, query_plan, index)
+            draft_answer = generate_draft_answer(
+                question=pipeline_question,
+                context=context,
+                query_plan=generation_query_plan,
+            )
         answer = finalize_answer(
-            question=q["question"],
+            question=pipeline_question,
             context=context,
             query_plan=generation_query_plan,
             draft_answer=draft_answer,
@@ -796,7 +861,7 @@ def run_pipeline(output_path: str = "submission.csv") -> None:
         log_block(
             "Stage 4",
             "Final answer",
-            f"Question: {q['question']}\nAnswer: {answer_one_line}",
+            f"Question: {pipeline_question}\nOriginal question: {raw_question}\nAnswer: {answer_one_line}",
         )
 
     # 저장 + 검증
