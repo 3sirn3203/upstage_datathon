@@ -1,0 +1,87 @@
+corpus:
+  dir: distribution/corpus
+
+parsing:
+  # Supported options: pdfplumber, upstage_api
+  backend: upstage_api
+  output_dir: parsed_corpus
+  force: false
+
+  pdfplumber:
+    extract_tables: true
+
+  upstage_api:
+    url: https://api.upstage.ai/v1/document-digitization
+    model: document-parse
+    ocr: auto
+    output_formats:
+      - markdown
+    timeout_seconds: 300
+
+chunking:
+  max_chunk_chars: 1200
+  overlap_chars: 200
+  min_chunk_chars: 80
+  include_table_chunks: true
+  output_filename: chunks.jsonl
+
+indexing:
+  bm25:
+    k1: 1.5
+    b: 0.75
+    top_k: 30
+  dense:
+    provider: upstage
+    url: https://api.upstage.ai/v1/solar/embeddings
+    passage_model: solar-embedding-1-large-passage
+    query_model: solar-embedding-1-large-query
+    dimension: 4096
+    batch_size: 16
+    sleep_seconds: 1
+    max_retries: 5
+    retry_base_seconds: 2
+    force: false
+    faiss_filename: dense.faiss
+    metadata_filename: dense_metadata.jsonl
+    embeddings_filename: dense_embeddings.npy
+
+retrieval:
+  bm25_top_k: 30
+  dense_top_k: 10
+  final_top_k: 20
+  iterative:
+    enabled: true
+    # Maximum number of extra retrieval rounds after the initial retrieval.
+    max_iterations: 2
+    iteration_decay: 0.9
+    missing_need_bonus: 0.25
+    cross_iteration_bonus: 0.2
+    min_followup_chunks: 2
+  merge:
+    rrf_k: 30
+    max_candidates: 40
+    max_chunks_per_doc: 4
+    max_chunks_per_section: 2
+    coverage_weight: 0.25
+    doc_repeat_penalty: 0.10
+
+llm:
+  query_analysis:
+    model: solar-pro
+    enabled: true
+    temperature: 0
+    max_tokens: 512
+  draft_generation:
+    model: solar-pro
+    enabled: true
+    temperature: 0
+    max_tokens: 768
+  context_evaluation:
+    model: solar-pro
+    enabled: true
+    temperature: 0
+    max_tokens: 512
+  final_generation:
+    model: solar-pro
+    temperature: 0
+    max_tokens: 768
