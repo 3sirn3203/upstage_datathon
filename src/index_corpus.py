@@ -6,7 +6,7 @@ Input:
 
 Outputs:
     parsed_corpus/<backend>/dense.faiss
-        FAISS IndexFlatIP over normalized Upstage passage embeddings.
+        FAISS IndexFlatIP over normalized bge-large-en-v1.5 passage embeddings.
 
     parsed_corpus/<backend>/dense_metadata.jsonl
         One metadata row per FAISS vector, preserving chunk fields except text is kept
@@ -20,15 +20,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 import faiss
 import numpy as np
+from sentence_transformers import SentenceTransformer
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -43,14 +42,10 @@ except ImportError:
 
 @dataclass
 class DenseIndexConfig:
-    url: str = "https://api.upstage.ai/v1/solar/embeddings"
-    passage_model: str = "solar-embedding-1-large-passage"
-    query_model: str = "solar-embedding-1-large-query"
-    dimension: int = 4096
-    batch_size: int = 16
-    sleep_seconds: float = 1.0
-    max_retries: int = 5
-    retry_base_seconds: float = 2.0
+    passage_model: str = "BAAI/bge-large-en-v1.5"
+    query_model: str = "BAAI/bge-large-en-v1.5"  # 동일 모델, 쿼리 시 사용
+    dimension: int = 1024
+    batch_size: int = 64
     force: bool = False
     faiss_filename: str = "dense.faiss"
     metadata_filename: str = "dense_metadata.jsonl"
@@ -60,14 +55,10 @@ class DenseIndexConfig:
 def config_from_dict(config: dict[str, Any]) -> DenseIndexConfig:
     dense = config.get("indexing", {}).get("dense", {})
     return DenseIndexConfig(
-        url=str(dense.get("url", "https://api.upstage.ai/v1/solar/embeddings")),
-        passage_model=str(dense.get("passage_model", "solar-embedding-1-large-passage")),
-        query_model=str(dense.get("query_model", "solar-embedding-1-large-query")),
-        dimension=int(dense.get("dimension", 4096)),
-        batch_size=int(dense.get("batch_size", 16)),
-        sleep_seconds=float(dense.get("sleep_seconds", 1)),
-        max_retries=int(dense.get("max_retries", 5)),
-        retry_base_seconds=float(dense.get("retry_base_seconds", 2)),
+        passage_model=str(dense.get("passage_model", "BAAI/bge-large-en-v1.5")),
+        query_model=str(dense.get("query_model", "BAAI/bge-large-en-v1.5")),
+        dimension=int(dense.get("dimension", 1024)),
+        batch_size=int(dense.get("batch_size", 64)),
         force=bool(dense.get("force", False)),
         faiss_filename=str(dense.get("faiss_filename", "dense.faiss")),
         metadata_filename=str(dense.get("metadata_filename", "dense_metadata.jsonl")),
@@ -102,74 +93,27 @@ def load_chunks(path: Path) -> list[dict[str, Any]]:
     return chunks
 
 
-def embed_texts(texts: list[str], model: str, config: DenseIndexConfig) -> np.ndarray:
-    api_key = os.environ.get("UPSTAGE_API_KEY")
-    if not api_key:
-        raise EnvironmentError("UPSTAGE_API_KEY is required to call the embedding API.")
-
+def embed_texts(texts: list[str], model_name: str, config: DenseIndexConfig) -> np.ndarray:
+    """sentence-transformers로 로컬 임베딩 (bge-large-en-v1.5)."""
     if not texts:
         return np.empty((0, config.dimension), dtype=np.float32)
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    vectors: list[list[float]] = []
+    print(f"[index_corpus] loading model: {model_name}")
+    model = SentenceTransformer(model_name)
 
-    for start in range(0, len(texts), config.batch_size):
-        batch = texts[start : start + config.batch_size]
-        response = post_embedding_batch(
-            url=config.url,
-            headers=headers,
-            payload={"input": batch, "model": model},
-            max_retries=config.max_retries,
-            retry_base_seconds=config.retry_base_seconds,
-        )
-        data = response.get("data", [])
-        if len(data) != len(batch):
-            raise RuntimeError(f"Embedding API returned {len(data)} vectors for {len(batch)} inputs")
-        vectors.extend(item["embedding"] for item in data)
+    print(f"[index_corpus] encoding {len(texts)} texts (batch_size={config.batch_size})")
+    embeddings = model.encode(
+        texts,
+        batch_size=config.batch_size,
+        normalize_embeddings=True,   # bge는 normalize 권장
+        show_progress_bar=True,
+    )
 
-        if start + config.batch_size < len(texts) and config.sleep_seconds > 0:
-            time.sleep(config.sleep_seconds)
-
-    matrix = np.array(vectors, dtype=np.float32)
-    if matrix.ndim != 2 or matrix.shape[1] != config.dimension:
-        raise RuntimeError(f"Expected embedding dimension {config.dimension}, got shape {matrix.shape}")
-    return matrix
-
-
-def post_embedding_batch(
-    *,
-    url: str,
-    headers: dict[str, str],
-    payload: dict[str, Any],
-    max_retries: int,
-    retry_base_seconds: float,
-) -> dict[str, Any]:
-    import requests
-
-    for attempt in range(max_retries + 1):
-        response = requests.post(url, headers=headers, json=payload, timeout=120)
-        if response.status_code == 200:
-            return response.json()
-
-        retryable = response.status_code in {408, 409, 425, 429, 500, 502, 503, 504}
-        if not retryable or attempt >= max_retries:
-            raise RuntimeError(f"Embedding API error [{response.status_code}]: {response.text}")
-
-        retry_after = response.headers.get("Retry-After")
-        if retry_after:
-            sleep_seconds = float(retry_after)
-        else:
-            sleep_seconds = retry_base_seconds * (2**attempt)
-        time.sleep(sleep_seconds)
-
-    raise RuntimeError("Embedding API retry loop exhausted unexpectedly")
+    return embeddings.astype(np.float32)
 
 
 def normalize_embeddings(matrix: np.ndarray) -> np.ndarray:
+    """embed_texts에서 이미 normalize했지만, 외부 호출 시 안전망으로 유지."""
     normalized = matrix.astype(np.float32, copy=True)
     norms = np.linalg.norm(normalized, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
@@ -219,8 +163,11 @@ def build_dense_index(
 
     chunks = load_chunks(chunks_path)
     texts = [chunk["text"] for chunk in chunks]
+
     print(f"[index_corpus] embedding {len(texts)} chunks with {dense_config.passage_model}")
     embeddings = embed_texts(texts, dense_config.passage_model, dense_config)
+    # sentence-transformers에서 normalize_embeddings=True로 이미 정규화됨
+    # 혹시 모를 수치 오차 보정
     embeddings = normalize_embeddings(embeddings)
 
     index = faiss.IndexFlatIP(dense_config.dimension)
